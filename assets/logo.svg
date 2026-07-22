@@ -1,1 +1,53 @@
-²ø1šYì
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#191C33"/>
+      <stop offset="55%" stop-color="#111327"/>
+      <stop offset="100%" stop-color="#0A0B18"/>
+    </radialGradient>
+    <linearGradient id="bubble" x1="230" y1="230" x2="800" y2="800" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"  stop-color="#7C3AED"/>
+      <stop offset="52%" stop-color="#EC4899"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+    <linearGradient id="bubbleEdge" x1="230" y1="230" x2="800" y2="800" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"  stop-color="#A78BFA"/>
+      <stop offset="52%" stop-color="#F9A8D4"/>
+      <stop offset="100%" stop-color="#FCD34D"/>
+    </linearGradient>
+    <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="26" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="softglow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="7" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+  <g fill="none" stroke="#FFFFFF" stroke-opacity="0.045">
+    <circle cx="512" cy="512" r="332" stroke-width="2"/>
+    <circle cx="512" cy="512" r="404" stroke-width="1.6"/>
+    <circle cx="512" cy="512" r="463" stroke-width="1.2"/>
+  </g>
+  <!-- three satellites: Instagram / TikTok / X -->
+  <g filter="url(#softglow)">
+    <circle cx="736" cy="216" r="12" fill="#EC4899"/>
+    <circle cx="812" cy="330" r="10" fill="#22D3EE"/>
+    <circle cx="856" cy="470" r="9"  fill="#F3F4F6"/>
+  </g>
+  <!-- chat bubble with tail -->
+  <g filter="url(#glow)">
+    <path fill="url(#bubble)" d="M 364 252 H 660 Q 772 252 772 364 V 600 Q 772 712 660 712 H 486 Q 470 790 394 836 Q 404 768 392 712 H 364 Q 252 712 252 600 V 364 Q 252 252 364 252 Z"/>
+  </g>
+  <path fill="none" stroke="url(#bubbleEdge)" stroke-width="4" stroke-opacity="0.55" d="M 364 252 H 660 Q 772 252 772 364 V 600 Q 772 712 660 712 H 486 Q 470 790 394 836 Q 404 768 392 712 H 364 Q 252 712 252 600 V 364 Q 252 252 364 252 Z"/>
+  <!-- googly eyes peering at the satellites -->
+  <g>
+    <ellipse cx="428" cy="478" rx="78" ry="94" fill="#FFFFFF"/>
+    <ellipse cx="600" cy="472" rx="66" ry="82" fill="#FFFFFF"/>
+    <circle cx="462" cy="446" r="34" fill="#1B1D35"/>
+    <circle cx="628" cy="444" r="30" fill="#1B1D35"/>
+    <circle cx="474" cy="434" r="10" fill="#FFFFFF"/>
+    <circle cx="639" cy="433" r="9"  fill="#FFFFFF"/>
+  </g>
+</svg>
