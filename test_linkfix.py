@@ -1,4 +1,4 @@
-"""Тесты логики преобразования ссылок: python3 -m pytest -q (или просто python3 test_linkfix.py)."""
+"""Тесты логики преобразования ссылок: python3 test_linkfix.py."""
 import linkfix
 from linkfix import convert
 
@@ -7,6 +7,7 @@ def test_instagram_reel():
     r = convert("https://www.instagram.com/reel/DaNx4QjtvH9/")
     assert r.original == "https://www.instagram.com/reel/DaNx4QjtvH9/"
     assert r.embed == "https://kkinstagram.com/reel/DaNx4QjtvH9/"
+    assert r.platform == "instagram" and r.emoji == "📸"
 
 
 def test_instagram_no_www():
@@ -28,6 +29,7 @@ def test_tiktok_short_t():
     r = convert("https://www.tiktok.com/t/ZP8tDesMB/")
     assert r.original == "https://www.tiktok.com/t/ZP8tDesMB/"
     assert r.embed == "https://kktiktok.com/t/ZP8tDesMB/"
+    assert r.platform == "tiktok" and r.emoji == "🎵"
 
 
 def test_tiktok_vm():
@@ -43,6 +45,39 @@ def test_tiktok_full_video():
 
 def test_tiktok_root_ignored():
     assert convert("https://www.tiktok.com/") is None
+
+
+def test_x_status():
+    r = convert("https://x.com/elonmusk/status/1234567890123456789")
+    assert r.original == "https://x.com/elonmusk/status/1234567890123456789"
+    assert r.embed == "https://fixupx.com/elonmusk/status/1234567890123456789"
+    assert r.platform == "x" and r.emoji == "🐦"
+
+
+def test_twitter_legacy_domain():
+    r = convert("https://twitter.com/user/status/111?s=20")
+    assert r.embed == "https://fixupx.com/user/status/111"
+    assert r.original == "https://x.com/user/status/111"
+
+
+def test_x_profile_ignored():
+    assert convert("https://x.com/elonmusk") is None
+
+
+def test_reddit_post():
+    r = convert("https://www.reddit.com/r/videos/comments/abc123/some_title/")
+    assert r.embed == "https://rxddit.com/r/videos/comments/abc123/some_title/"
+    assert r.platform == "reddit" and r.emoji == "👽"
+
+
+def test_reddit_short():
+    r = convert("https://redd.it/abc123")
+    assert r.original == "https://www.reddit.com/comments/abc123/"
+    assert r.embed == "https://rxddit.com/comments/abc123/"
+
+
+def test_reddit_sub_ignored():
+    assert convert("https://www.reddit.com/r/videos/") is None
 
 
 def test_bare_url_without_scheme():

@@ -1,6 +1,8 @@
 # kk-linkfix-bot
 
-Telegram-бот для групп: превращает ссылки Instagram (Reels/посты) и TikTok в сообщения с инлайн-видео, которое можно смотреть прямо в чате.
+Telegram-бот для групп: превращает ссылки Instagram (Reels/посты), TikTok, X/Twitter и Reddit в сообщения с инлайн-видео, которое можно смотреть прямо в чате.
+
+Поддерживаемые источники и иконки подписи: 📸 Instagram · 🎵 TikTok · 🐦 X/Twitter · 👽 Reddit. (YouTube не нужен — Telegram проигрывает его сам.)
 
 ## Как работает
 
@@ -35,6 +37,8 @@ docker compose up -d --build
 | `PROXY_URL` | прокси до api.telegram.org (для серверов в РФ), пусто = напрямую |
 | `INSTAGRAM_FIX_DOMAIN` | домен фиксера Instagram (по умолчанию `kkinstagram.com`) |
 | `TIKTOK_FIX_DOMAIN` | домен фиксера TikTok (по умолчанию `kktiktok.com`) |
+| `TWITTER_FIX_DOMAIN` | домен фиксера X/Twitter (по умолчанию `fixupx.com`) |
+| `REDDIT_FIX_DOMAIN` | домен фиксера Reddit (по умолчанию `rxddit.com`) |
 
 Если домен-фиксер перестал работать — просто замените его в `.env` на аналог (`ddinstagram.com`, `vxtiktok.com`, ...) и перезапустите: `docker compose up -d`.
 
