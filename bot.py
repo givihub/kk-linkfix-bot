@@ -1,7 +1,7 @@
 """kk-linkfix-bot — превращает ссылки Instagram/TikTok в группе в инлайн-видео.
 
 Механика: бот видит сообщение со ссылкой, удаляет его и отправляет вместо него
-аккуратное сообщение «🎬 Ссылка — от <автор>», где:
+аккуратное сообщение: видео, а под ним подпись «🎬 Ссылка», где:
   * видимая гиперссылка «Ссылка» ведёт на оригинальный www-адрес;
   * видео-превью генерируется по скрытому kk-адресу
     (link_preview_options.url — URL превью не обязан присутствовать в тексте).
@@ -13,7 +13,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -52,14 +51,6 @@ def _extract_links(message: Message) -> list[FixedLink]:
     return found
 
 
-def _sender_mention(message: Message) -> str:
-    u = message.from_user
-    if u is None:
-        return escape(message.sender_chat.title if message.sender_chat else "аноним")
-    name = escape(u.full_name)
-    return f'<a href="tg://user?id={u.id}">{name}</a>'
-
-
 @router.message(
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE})
 )
@@ -79,14 +70,15 @@ async def on_message(message: Message, bot: Bot) -> None:
 
     sent_all = True
     for fixed in links:
-        text = f'🎬 <a href="{fixed.original}">Ссылка</a> — от {_sender_mention(message)}'
+        text = f'🎬 <a href="{fixed.original}">Ссылка</a>'
         try:
             await message.answer(
                 text,
                 link_preview_options=LinkPreviewOptions(
                     url=fixed.embed,
                     prefer_large_media=True,
-                    show_above_text=False,
+                    # превью (видео) над текстом — подпись «Ссылка» оказывается снизу
+                    show_above_text=True,
                 ),
             )
         except Exception:  # noqa: BLE001
