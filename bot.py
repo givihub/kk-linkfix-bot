@@ -1,10 +1,10 @@
-"""kk-linkfix-bot — превращает ссылки Instagram/TikTok в группе в инлайн-видео.
+"""kk-linkfix-bot — превращает ссылки Instagram/TikTok/X в группе в инлайн-видео.
 
 Механика: бот видит сообщение со ссылкой и отвечает на него (реплаем) сообщением
-с видео и минимальной подписью — названием источника (Instagram/TikTok/𝕏).
-Исходное сообщение не удаляется, поэтому автор ссылки виден штатно.
-Видео-превью генерируется по скрытому фикс-адресу
-(link_preview_options.url — URL превью не обязан присутствовать в тексте).
+с видео. Подпись: название источника + автор и текст поста (если их удалось
+достать из OG-метатегов страницы фиксера; для Instagram текст пока недоступен —
+kkinstagram отдаёт прямой mp4 без метаданных).
+Видео-превью генерируется по скрытому фикс-адресу (link_preview_options.url).
 
 Скачивания видео нет — превью отдаёт Telegram, боту хватает минимума ресурсов.
 """
@@ -13,7 +13,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
+from html import escape, unescape
+from urllib.parse import urlsplit, urlunsplit
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -29,6 +33,81 @@ logging.basicConfig(
 log = logging.getLogger("kk-linkfix-bot")
 
 router = Router()
+
+PROXY_URL = os.getenv("PROXY_URL") or None
+
+# Откуда брать автора и текст поста (og:title / og:description).
+# Пусто = для этой платформы текст не подтягиваем.
+CAPTION_DOMAINS = {
+    "tiktok": os.getenv("TIKTOK_CAPTION_DOMAIN", "tnktok.com"),
+    "x": os.getenv("TWITTER_CAPTION_DOMAIN", "fixupx.com"),
+    "instagram": os.getenv("INSTAGRAM_CAPTION_DOMAIN", ""),
+}
+
+_UA = {"User-Agent": "TelegramBot (like TwitterBot)"}
+_OG_PATTERNS = (
+    re.compile(
+        r'<meta[^>]*?property=["\']og:(title|description)["\'][^>]*?content=["\']([^"\']*)',
+        re.I | re.S,
+    ),
+    re.compile(
+        r'<meta[^>]*?content=["\']([^"\']*)["\'][^>]*?property=["\']og:(title|description)',
+        re.I | re.S,
+    ),
+)
+
+_http: aiohttp.ClientSession | None = None
+
+
+def _caption_url(fixed: FixedLink) -> str | None:
+    domain = CAPTION_DOMAINS.get(fixed.platform)
+    if not domain:
+        return None
+    parts = urlsplit(fixed.embed)
+    return urlunsplit((parts.scheme, domain, parts.path, parts.query, ""))
+
+
+async def _fetch_meta(fixed: FixedLink) -> dict[str, str]:
+    """og:title/og:description со страницы фиксера. Fail-soft: {} при любой ошибке."""
+    url = _caption_url(fixed)
+    if not url or _http is None:
+        return {}
+    try:
+        async with _http.get(
+            url,
+            proxy=PROXY_URL,
+            allow_redirects=True,
+            headers=_UA,
+            timeout=aiohttp.ClientTimeout(total=4),
+        ) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            if resp.status != 200 or "html" not in ctype:
+                return {}
+            raw = await resp.content.read(262_144)
+    except Exception:  # noqa: BLE001
+        return {}
+    html_text = raw.decode("utf-8", "ignore")
+    meta: dict[str, str] = {}
+    for key, val in _OG_PATTERNS[0].findall(html_text):
+        meta.setdefault(key.lower(), unescape(val).strip())
+    for val, key in _OG_PATTERNS[1].findall(html_text):
+        meta.setdefault(key.lower(), unescape(val).strip())
+    return meta
+
+
+def _build_text(fixed: FixedLink, meta: dict[str, str]) -> str:
+    head = f"<b>{fixed.label}</b>"
+    title = meta.get("title", "").strip()
+    if title:
+        if len(title) > 80:
+            title = title[:79] + "…"
+        head += f" · {escape(title)}"
+    desc = meta.get("description", "").strip()
+    if not desc:
+        return head
+    if len(desc) > 900:
+        desc = desc[:899] + "…"
+    return f"{head}\n<blockquote expandable>{escape(desc)}</blockquote>"
 
 
 def _extract_links(message: Message) -> list[FixedLink]:
@@ -69,12 +148,12 @@ async def on_message(message: Message, bot: Bot) -> None:
     )
 
     # Режим «реплай»: исходное сообщение остаётся (автор виден штатно),
-    # бот отвечает на него видео с минимальной подписью — названием источника.
+    # бот отвечает на него видео с подписью: источник + автор + текст поста.
     for fixed in links:
-        text = f'<b>{fixed.label}</b>'
+        meta = await _fetch_meta(fixed)
         try:
             await message.reply(
-                text,
+                _build_text(fixed, meta),
                 link_preview_options=LinkPreviewOptions(
                     url=fixed.embed,
                     prefer_large_media=True,
@@ -92,10 +171,9 @@ async def main() -> None:
     if not token:
         raise SystemExit("BOT_TOKEN не задан (см. .env.example)")
 
-    proxy_url = os.getenv("PROXY_URL") or None
-    session = AiohttpSession(proxy=proxy_url) if proxy_url else None
-    if proxy_url:
-        log.info("Работаю через прокси: %s", proxy_url)
+    session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else None
+    if PROXY_URL:
+        log.info("Работаю через прокси: %s", PROXY_URL)
 
     bot = Bot(
         token=token,
@@ -105,10 +183,15 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    me = await bot.get_me()
-    log.info("Запущен как @%s (id=%s)", me.username, me.id)
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, allowed_updates=["message"])
+    global _http
+    _http = aiohttp.ClientSession()
+    try:
+        me = await bot.get_me()
+        log.info("Запущен как @%s (id=%s)", me.username, me.id)
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot, allowed_updates=["message"])
+    finally:
+        await _http.close()
 
 
 if __name__ == "__main__":
