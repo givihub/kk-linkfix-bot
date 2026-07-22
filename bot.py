@@ -1,10 +1,10 @@
 """kk-linkfix-bot — превращает ссылки Instagram/TikTok в группе в инлайн-видео.
 
-Механика: бот видит сообщение со ссылкой, удаляет его и отправляет вместо него
-аккуратное сообщение: видео, а под ним подпись «🎬 Ссылка», где:
-  * видимая гиперссылка «Ссылка» ведёт на оригинальный www-адрес;
-  * видео-превью генерируется по скрытому kk-адресу
-    (link_preview_options.url — URL превью не обязан присутствовать в тексте).
+Механика: бот видит сообщение со ссылкой и отвечает на него (реплаем) сообщением
+с видео и минимальной подписью — названием источника (Instagram/TikTok/𝕏).
+Исходное сообщение не удаляется, поэтому автор ссылки виден штатно.
+Видео-превью генерируется по скрытому фикс-адресу
+(link_preview_options.url — URL превью не обязан присутствовать в тексте).
 
 Скачивания видео нет — превью отдаёт Telegram, боту хватает минимума ресурсов.
 """
@@ -68,32 +68,23 @@ async def on_message(message: Message, bot: Bot) -> None:
         len(links),
     )
 
-    sent_all = True
+    # Режим «реплай»: исходное сообщение остаётся (автор виден штатно),
+    # бот отвечает на него видео с минимальной подписью — названием источника.
     for fixed in links:
-        text = f'<b>{fixed.label}</b> · <a href="{fixed.original}">Ссылка</a>'
+        text = f'<b>{fixed.label}</b>'
         try:
-            await message.answer(
+            await message.reply(
                 text,
                 link_preview_options=LinkPreviewOptions(
                     url=fixed.embed,
                     prefer_large_media=True,
-                    # превью (видео) над текстом — подпись «Ссылка» оказывается снизу
+                    # превью (видео) над текстом — подпись оказывается снизу
                     show_above_text=True,
                 ),
+                disable_notification=True,
             )
         except Exception:  # noqa: BLE001
-            sent_all = False
             log.exception("Не удалось отправить сообщение с превью")
-
-    # Удаляем исходное сообщение только если все замены отправились
-    if sent_all:
-        try:
-            await message.delete()
-        except Exception:  # noqa: BLE001
-            log.warning(
-                "Нет прав на удаление сообщения в чате %s — оставляю оригинал",
-                message.chat.id,
-            )
 
 
 async def main() -> None:
