@@ -1,0 +1,3 @@
+# DevSecOps: версии пинованы
+aiogram==3.30.0
+aiohttp-socks==0.11.0  # нужен aiogram для работы через прокси (PROXY_URL)

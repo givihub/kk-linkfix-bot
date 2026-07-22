@@ -1,0 +1,22 @@
+services:
+  kk-linkfix-bot:
+    build: .
+    container_name: kk-linkfix-bot
+    restart: unless-stopped
+    # host-сеть: боту нужен Xray-прокси хоста (127.0.0.1:7890) для Telegram API.
+    # Входящих портов бот не открывает (long polling), так что поверхность атаки не растёт.
+    network_mode: host
+    env_file: .env
+    # DevSecOps: только чтение ФС, без эскалации привилегий, без лишних capabilities
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
