@@ -70,7 +70,7 @@ async def on_message(message: Message, bot: Bot) -> None:
 
     sent_all = True
     for fixed in links:
-        text = f'{fixed.emoji} <a href="{fixed.original}">Ссылка</a>'
+        text = f'<b>{fixed.label}</b> · <a href="{fixed.original}">Ссылка</a>'
         try:
             await message.answer(
                 text,

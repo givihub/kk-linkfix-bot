@@ -1,4 +1,4 @@
-"""Логика распознавания и преобразования ссылок Instagram/TikTok/X/Reddit.
+"""Логика распознавания и преобразования ссылок Instagram/TikTok/X.
 
 Чистые функции без зависимостей от aiogram — удобно тестировать.
 """
@@ -13,14 +13,12 @@ from urllib.parse import urlsplit
 INSTAGRAM_FIX_DOMAIN = os.getenv("INSTAGRAM_FIX_DOMAIN", "kkinstagram.com")
 TIKTOK_FIX_DOMAIN = os.getenv("TIKTOK_FIX_DOMAIN", "kktiktok.com")
 TWITTER_FIX_DOMAIN = os.getenv("TWITTER_FIX_DOMAIN", "fixupx.com")
-REDDIT_FIX_DOMAIN = os.getenv("REDDIT_FIX_DOMAIN", "rxddit.com")
 
-# Иконка источника для подписи под видео
-EMOJI = {
-    "instagram": "📸",
-    "tiktok": "🎵",
-    "x": "🐦",
-    "reddit": "👽",
+# Название источника для подписи под видео («𝕏» — юникод-логотип X)
+LABEL = {
+    "instagram": "Instagram",
+    "tiktok": "TikTok",
+    "x": "𝕏",
 }
 
 # Пути Instagram, у которых бывает видео-превью
@@ -31,11 +29,11 @@ _INSTA_PREFIXES = ("/reel/", "/reels/", "/p/", "/tv/")
 class FixedLink:
     original: str  # каноничная «красивая» ссылка (www-вид) — идёт в текст
     embed: str     # фикс-ссылка — идёт в link_preview_options.url (скрыта)
-    platform: str  # instagram | tiktok | x | reddit
+    platform: str  # instagram | tiktok | x
 
     @property
-    def emoji(self) -> str:
-        return EMOJI.get(self.platform, "🎬")
+    def label(self) -> str:
+        return LABEL.get(self.platform, "Видео")
 
 
 def _norm_host(netloc: str) -> str:
@@ -95,27 +93,6 @@ def convert(url: str) -> FixedLink | None:
             original=f"https://x.com{path}",
             embed=f"https://{TWITTER_FIX_DOMAIN}{path}",
             platform="x",
-        )
-
-    # --- Reddit: короткие redd.it ------------------------------------------
-    if host == "redd.it":
-        code = path.strip("/").split("/")[0]
-        if not code:
-            return None
-        return FixedLink(
-            original=f"https://www.reddit.com/comments/{code}/",
-            embed=f"https://{REDDIT_FIX_DOMAIN}/comments/{code}/",
-            platform="reddit",
-        )
-
-    # --- Reddit: обычные ссылки на пост -------------------------------------
-    if host in ("reddit.com", "old.reddit.com", REDDIT_FIX_DOMAIN, "vxreddit.com"):
-        if "/comments/" not in path and not path.startswith("/comments/"):
-            return None
-        return FixedLink(
-            original=f"https://www.reddit.com{path}",
-            embed=f"https://{REDDIT_FIX_DOMAIN}{path}",
-            platform="reddit",
         )
 
     return None
