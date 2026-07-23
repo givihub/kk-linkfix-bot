@@ -110,6 +110,15 @@ async def _fetch_meta(fixed: FixedLink) -> dict[str, str]:
     return meta
 
 
+# Редирект на сам соцсеть-сайт = фиксер расписался в бессилии, это не видео
+_PLATFORM_HOSTS = ("instagram.com", "tiktok.com", "x.com", "twitter.com")
+
+
+def _is_platform_host(url: str) -> bool:
+    host = urlsplit(url).netloc.split("@")[-1].split(":")[0].lower()
+    return any(host == h or host.endswith("." + h) for h in _PLATFORM_HOSTS)
+
+
 _OG_VIDEO_PATTERNS = (
     re.compile(
         r'<meta[^>]*?property=["\']og:video(?::url)?["\'][^>]*?content=["\']([^"\']+)',
@@ -140,6 +149,12 @@ async def _resolve_video(fixed: FixedLink) -> str | None:
             ) as resp:
                 loc = resp.headers.get("Location", "")
                 if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
+                    if _is_platform_host(loc):
+                        log.info(
+                            "resolve %s: redirect обратно на соцсеть — не видео, дальше",
+                            netloc,
+                        )
+                        continue
                     log.info("resolve %s: redirect → видео найдено", netloc)
                     return loc
                 if resp.status == 200 and "html" in resp.headers.get("Content-Type", ""):
@@ -183,6 +198,10 @@ async def _download_video(url: str) -> bytes | None:
                 if len(buf) > _MAX_VIDEO:
                     log.warning("Видео превысило лимит %d МБ при скачивании", _MAX_VIDEO // 1048576)
                     return None
+            # Санити-чек: это точно mp4, а не HTML-страница/ошибка
+            if len(buf) < 10_000 or b"ftyp" not in bytes(buf[:64]):
+                log.warning("Скачанное не похоже на видео (%d байт) — отбрасываю", len(buf))
+                return None
             return bytes(buf)
     except Exception as e:  # noqa: BLE001
         log.warning("Не удалось скачать видео: %s", e)
@@ -321,6 +340,7 @@ async def on_message(message: Message, bot: Bot) -> None:
     # затем удаляет исходное сообщение (если хватает прав).
     sender = _sender_mention(message)
     sent_all = True
+    all_video = True  # оригинал удаляем только если видео реально доставлено
     for fixed in links:
         # Индикатор «отправляет видео…» в шапке чата
         try:
@@ -362,8 +382,9 @@ async def on_message(message: Message, bot: Bot) -> None:
                         e,
                     )
 
-        # Fallback: сообщение с веб-превью (без лимита 20 МБ)
+        # Fallback: сообщение с веб-превью (без лимита 45 МБ)
         if not sent:
+            all_video = False
             try:
                 await message.answer(
                     text,
@@ -380,8 +401,9 @@ async def on_message(message: Message, bot: Bot) -> None:
                 sent_all = False
                 log.exception("Не удалось отправить сообщение с превью")
 
-    # Удаляем оригинал только если все замены дошли
-    if sent_all:
+    # Удаляем оригинал только если каждое видео реально доставлено файлом.
+    # Если пришлось откатиться на превью — оригинал не трогаем (честнее).
+    if sent_all and all_video:
         try:
             await message.delete()
         except Exception:  # noqa: BLE001
