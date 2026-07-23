@@ -129,7 +129,7 @@ def _keyboard(fixed: FixedLink) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(
-                text=f"Открыть в {fixed.label} ↗",
+                text=f"{fixed.label} ↗",
                 url=fixed.original,
             )
         ]]
