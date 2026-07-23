@@ -314,13 +314,21 @@ async def on_message(message: Message, bot: Bot) -> None:
     sender = _sender_mention(message)
     sent_all = True
     for fixed in links:
-        meta = await _fetch_meta(fixed)
+        # Индикатор «отправляет видео…» в шапке чата
+        try:
+            await bot.send_chat_action(message.chat.id, "upload_video")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Текст поста и резолв видео — параллельно (экономит до ~4 с)
+        meta_task = asyncio.create_task(_fetch_meta(fixed))
+        video_url = await _resolve_video(fixed)
+        meta = await meta_task
         text = _build_text(fixed, meta, sender)
         sent = False
 
         # Основной путь: скачать видео через прокси и загрузить в Telegram
         # как файл — не зависит ни от кэша превью, ни от блокировок CDN.
-        video_url = await _resolve_video(fixed)
         if video_url:
             data = await _download_video(video_url)
             if data:
