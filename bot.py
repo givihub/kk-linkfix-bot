@@ -110,23 +110,45 @@ async def _fetch_meta(fixed: FixedLink) -> dict[str, str]:
     return meta
 
 
+_OG_VIDEO_PATTERNS = (
+    re.compile(
+        r'<meta[^>]*?property=["\']og:video(?::url)?["\'][^>]*?content=["\']([^"\']+)',
+        re.I,
+    ),
+    re.compile(
+        r'<meta[^>]*?content=["\']([^"\']+)["\'][^>]*?property=["\']og:video(?::url)?["\']',
+        re.I,
+    ),
+)
+
+
 async def _resolve_video(fixed: FixedLink) -> str | None:
-    """Прямой URL видеофайла: фиксеры отвечают redirect'ом на mp4. None = нет."""
+    """Прямой URL видеофайла. Перебирает цепочку доменов-фиксеров:
+    понимает и redirect на mp4 (kk*), и og:video на странице (tnktok, vxinstagram).
+    None = ни один фиксер не отдал видео."""
     if _http is None:
         return None
-    try:
-        async with _http.get(
-            fixed.embed,
-            proxy=PROXY_URL,
-            allow_redirects=False,
-            headers=_UA,
-            timeout=aiohttp.ClientTimeout(total=6),
-        ) as resp:
-            loc = resp.headers.get("Location", "")
-            if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
-                return loc
-    except Exception:  # noqa: BLE001
-        pass
+    for url in fixed.candidates:
+        try:
+            async with _http.get(
+                url,
+                proxy=PROXY_URL,
+                allow_redirects=False,
+                headers=_UA,
+                timeout=aiohttp.ClientTimeout(total=6),
+            ) as resp:
+                loc = resp.headers.get("Location", "")
+                if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
+                    return loc
+                if resp.status == 200 and "html" in resp.headers.get("Content-Type", ""):
+                    html_text = (await resp.content.read(262_144)).decode("utf-8", "ignore")
+                    for pat in _OG_VIDEO_PATTERNS:
+                        m = pat.search(html_text)
+                        if m and m.group(1).startswith("http"):
+                            return unescape(m.group(1))
+        except Exception as e:  # noqa: BLE001
+            log.info("Фиксер %s не ответил: %s — пробую следующий", urlsplit(url).netloc, e)
+            continue
     return None
 
 

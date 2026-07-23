@@ -1,18 +1,27 @@
 """Логика распознавания и преобразования ссылок Instagram/TikTok/X.
 
 Чистые функции без зависимостей от aiogram — удобно тестировать.
+Домены фиксеров задаются ЦЕПОЧКАМИ (через запятую в env): бот пробует их
+по порядку, пока какой-то не отдаст видео. Первый в списке — основной,
+он же используется для embed-ссылки в fallback-превью.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
-# Домены «фиксеров» (генерируют видео-превью для Telegram).
-# Выносим в env, чтобы при смерти сервиса поменять одной строкой без правки кода.
-INSTAGRAM_FIX_DOMAIN = os.getenv("INSTAGRAM_FIX_DOMAIN", "kkinstagram.com")
-TIKTOK_FIX_DOMAIN = os.getenv("TIKTOK_FIX_DOMAIN", "kktiktok.com")
-TWITTER_FIX_DOMAIN = os.getenv("TWITTER_FIX_DOMAIN", "fixupx.com")
+
+def _domains(env: str, default: str) -> list[str]:
+    return [d.strip() for d in os.getenv(env, default).split(",") if d.strip()]
+
+
+# Цепочки фиксеров (порядок = приоритет). Меняются в .env без правки кода.
+FIX_DOMAINS: dict[str, list[str]] = {
+    "instagram": _domains("INSTAGRAM_FIX_DOMAINS", "kkinstagram.com,vxinstagram.com"),
+    "tiktok": _domains("TIKTOK_FIX_DOMAINS", "kktiktok.com,tnktok.com,a.tnktok.com"),
+    "x": _domains("TWITTER_FIX_DOMAINS", "d.fixupx.com,d.fxtwitter.com,d.vxtwitter.com"),
+}
 
 # Название источника для подписи под видео («𝕏» — юникод-логотип X)
 LABEL = {
@@ -27,13 +36,22 @@ _INSTA_PREFIXES = ("/reel/", "/reels/", "/p/", "/tv/")
 
 @dataclass(frozen=True)
 class FixedLink:
-    original: str  # каноничная «красивая» ссылка (www-вид) — идёт в текст
-    embed: str     # фикс-ссылка — идёт в link_preview_options.url (скрыта)
+    original: str  # каноничная «красивая» ссылка (www-вид) — идёт в текст/кнопку
+    embed: str     # фикс-ссылка основного домена (используется в fallback-превью)
     platform: str  # instagram | tiktok | x
 
     @property
     def label(self) -> str:
         return LABEL.get(self.platform, "Видео")
+
+    @property
+    def candidates(self) -> list[str]:
+        """Все варианты фикс-ссылки по цепочке доменов платформы."""
+        parts = urlsplit(self.embed)
+        return [
+            urlunsplit((parts.scheme, d, parts.path, parts.query, ""))
+            for d in FIX_DOMAINS.get(self.platform, [])
+        ]
 
 
 def _norm_host(netloc: str) -> str:
@@ -51,12 +69,12 @@ def convert(url: str) -> FixedLink | None:
     path = parts.path or "/"
 
     # --- Instagram ---------------------------------------------------------
-    if host in ("instagram.com", INSTAGRAM_FIX_DOMAIN, "ddinstagram.com"):
+    if host in ("instagram.com", "ddinstagram.com", *FIX_DOMAINS["instagram"]):
         if not path.startswith(_INSTA_PREFIXES):
             return None
         return FixedLink(
             original=f"https://www.instagram.com{path}",
-            embed=f"https://{INSTAGRAM_FIX_DOMAIN}{path}",
+            embed=f"https://{FIX_DOMAINS['instagram'][0]}{path}",
             platform="instagram",
         )
 
@@ -67,34 +85,34 @@ def convert(url: str) -> FixedLink | None:
             return None
         return FixedLink(
             original=f"https://www.tiktok.com/t/{code}/",
-            embed=f"https://{TIKTOK_FIX_DOMAIN}/t/{code}/",
+            embed=f"https://{FIX_DOMAINS['tiktok'][0]}/t/{code}/",
             platform="tiktok",
         )
 
-    # --- TikTok: обычные и kk-ссылки ---------------------------------------
-    if host in ("tiktok.com", TIKTOK_FIX_DOMAIN, "vxtiktok.com"):
+    # --- TikTok: обычные и фикс-ссылки --------------------------------------
+    if host in ("tiktok.com", "vxtiktok.com", *FIX_DOMAINS["tiktok"]):
         if path in ("", "/"):
             return None
         query = f"?{parts.query}" if parts.query and "/video/" in path else ""
         return FixedLink(
             original=f"https://www.tiktok.com{path}{query}",
-            embed=f"https://{TIKTOK_FIX_DOMAIN}{path}",
+            embed=f"https://{FIX_DOMAINS['tiktok'][0]}{path}",
             platform="tiktok",
         )
 
     # --- X / Twitter --------------------------------------------------------
-    # embed идёт на медиа-поддомен d.* (только видео, без текста в превью) —
+    # Домены цепочки — медиа-поддомены d.* (только видео, без текста в превью):
     # текст твита бот добавляет сам в тело сообщения (его можно переводить).
     if host in (
         "x.com", "twitter.com", "mobile.twitter.com", "mobile.x.com",
-        TWITTER_FIX_DOMAIN, f"d.{TWITTER_FIX_DOMAIN}",
         "fxtwitter.com", "vxtwitter.com", "fixupx.com",
+        *FIX_DOMAINS["x"],
     ):
         if "/status/" not in path:
             return None
         return FixedLink(
             original=f"https://x.com{path}",
-            embed=f"https://d.{TWITTER_FIX_DOMAIN}{path}",
+            embed=f"https://{FIX_DOMAINS['x'][0]}{path}",
             platform="x",
         )
 
