@@ -25,6 +25,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatType, MessageEntityType, ParseMode
 from aiogram.types import (
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -52,6 +53,11 @@ CAPTION_DOMAINS = {
 }
 
 _UA = {"User-Agent": "TelegramBot (like TwitterBot)"}
+_BROWSER_UA = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+}
+_MAX_VIDEO = 45 * 1024 * 1024  # 45 МБ (лимит загрузки ботом — 50 МБ)
 _OG_PATTERNS = (
     re.compile(
         r'<meta[^>]*?property=["\']og:(title|description)["\'][^>]*?content=["\']([^"\']*)',
@@ -120,6 +126,35 @@ async def _resolve_video(fixed: FixedLink) -> str | None:
     except Exception:  # noqa: BLE001
         pass
     return None
+
+
+async def _download_video(url: str) -> bytes | None:
+    """Скачать видеофайл (в память, до 45 МБ). None при любой ошибке."""
+    if _http is None:
+        return None
+    try:
+        async with _http.get(
+            url,
+            proxy=PROXY_URL,
+            headers=_BROWSER_UA,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            clen = int(resp.headers.get("Content-Length") or 0)
+            if clen > _MAX_VIDEO:
+                log.warning("Видео слишком большое: %d МБ", clen // 1048576)
+                return None
+            buf = bytearray()
+            async for chunk in resp.content.iter_chunked(65536):
+                buf.extend(chunk)
+                if len(buf) > _MAX_VIDEO:
+                    log.warning("Видео превысило лимит %d МБ при скачивании", _MAX_VIDEO // 1048576)
+                    return None
+            return bytes(buf)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось скачать видео: %s", e)
+        return None
 
 
 def _sender_mention(message: Message) -> str:
@@ -202,23 +237,27 @@ async def on_message(message: Message, bot: Bot) -> None:
         text = _build_text(fixed, meta, sender)
         sent = False
 
-        # Основной путь: настоящее видео-сообщение (sendVideo по прямому URL).
-        # Надёжнее превью: не зависит от кэша веб-превью Telegram.
+        # Основной путь: скачать видео через прокси и загрузить в Telegram
+        # как файл — не зависит ни от кэша превью, ни от блокировок CDN.
         video_url = await _resolve_video(fixed)
         if video_url:
-            try:
-                await message.answer_video(
-                    video=video_url,
-                    caption=text,
-                    reply_markup=_keyboard(fixed),
-                    disable_notification=True,
-                )
-                sent = True
-            except Exception:  # noqa: BLE001
-                log.warning(
-                    "sendVideo не прошёл (%s, >20МБ или недоступен) — откат на превью",
-                    fixed.platform,
-                )
+            data = await _download_video(video_url)
+            if data:
+                try:
+                    await message.answer_video(
+                        video=BufferedInputFile(data, filename="video.mp4"),
+                        caption=text,
+                        reply_markup=_keyboard(fixed),
+                        disable_notification=True,
+                        request_timeout=300,
+                    )
+                    sent = True
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "Загрузка видео в Telegram не прошла (%s): %s — откат на превью",
+                        fixed.platform,
+                        e,
+                    )
 
         # Fallback: сообщение с веб-превью (без лимита 20 МБ)
         if not sent:
