@@ -13,9 +13,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import tempfile
 from html import escape, unescape
 from urllib.parse import urlsplit, urlunsplit
 
@@ -157,6 +159,63 @@ async def _download_video(url: str) -> bytes | None:
         return None
 
 
+async def _run(cmd: list[str]) -> tuple[int, bytes]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode or 0, out or b""
+
+
+async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
+    """Faststart-ремукс (чтобы Telegram стримил) + размеры/длительность + обложка.
+
+    Fail-soft: при любой ошибке возвращаем исходные байты без метаданных.
+    """
+    meta: dict = {}
+    thumb: bytes | None = None
+    try:
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            src = os.path.join(td, "in.mp4")
+            dst = os.path.join(td, "out.mp4")
+            th = os.path.join(td, "thumb.jpg")
+            with open(src, "wb") as f:
+                f.write(data)
+            rc, _ = await _run(
+                ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst]
+            )
+            target = dst if rc == 0 and os.path.getsize(dst) > 0 else src
+            if target == dst:
+                with open(dst, "rb") as f:
+                    data = f.read()
+            rc, out = await _run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height:format=duration",
+                 "-of", "json", target]
+            )
+            if rc == 0:
+                j = json.loads(out.decode("utf-8", "ignore") or "{}")
+                st = (j.get("streams") or [{}])[0]
+                dur = (j.get("format") or {}).get("duration") or 0
+                meta = {
+                    "width": st.get("width"),
+                    "height": st.get("height"),
+                    "duration": int(float(dur)) or None,
+                }
+            rc, _ = await _run(
+                ["ffmpeg", "-y", "-i", target, "-ss", "0.1", "-frames:v", "1",
+                 "-vf", "scale=320:-2", th]
+            )
+            if rc == 0 and os.path.exists(th):
+                with open(th, "rb") as f:
+                    thumb = f.read()
+    except Exception as e:  # noqa: BLE001
+        log.warning("ffmpeg-подготовка не удалась: %s", e)
+    return data, meta, thumb
+
+
 def _sender_mention(message: Message) -> str:
     u = message.from_user
     if u is None:
@@ -243,12 +302,18 @@ async def on_message(message: Message, bot: Bot) -> None:
         if video_url:
             data = await _download_video(video_url)
             if data:
+                data, vmeta, thumb = await _prepare_video(data)
                 try:
                     await message.answer_video(
                         video=BufferedInputFile(data, filename="video.mp4"),
                         caption=text,
                         reply_markup=_keyboard(fixed),
                         disable_notification=True,
+                        supports_streaming=True,
+                        width=vmeta.get("width"),
+                        height=vmeta.get("height"),
+                        duration=vmeta.get("duration"),
+                        thumbnail=BufferedInputFile(thumb, "thumb.jpg") if thumb else None,
                         request_timeout=300,
                     )
                     sent = True
