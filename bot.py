@@ -102,6 +102,26 @@ async def _fetch_meta(fixed: FixedLink) -> dict[str, str]:
     return meta
 
 
+async def _resolve_video(fixed: FixedLink) -> str | None:
+    """Прямой URL видеофайла: фиксеры отвечают redirect'ом на mp4. None = нет."""
+    if _http is None:
+        return None
+    try:
+        async with _http.get(
+            fixed.embed,
+            proxy=PROXY_URL,
+            allow_redirects=False,
+            headers=_UA,
+            timeout=aiohttp.ClientTimeout(total=6),
+        ) as resp:
+            loc = resp.headers.get("Location", "")
+            if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
+                return loc
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def _sender_mention(message: Message) -> str:
     u = message.from_user
     if u is None:
@@ -118,8 +138,8 @@ def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str) -> str:
         lines.append(f"<b>{escape(title)}</b>")
     desc = meta.get("description", "").strip()
     if desc:
-        if len(desc) > 900:
-            desc = desc[:899] + "…"
+        if len(desc) > 750:  # лимит подписи к видео — 1024 видимых символа
+            desc = desc[:749] + "…"
         lines.append(f"<blockquote expandable>{escape(desc)}</blockquote>")
     lines.append(f"👤 от {sender}")
     return "\n".join(lines)
@@ -179,21 +199,44 @@ async def on_message(message: Message, bot: Bot) -> None:
     sent_all = True
     for fixed in links:
         meta = await _fetch_meta(fixed)
-        try:
-            await message.answer(
-                _build_text(fixed, meta, sender),
-                link_preview_options=LinkPreviewOptions(
-                    url=fixed.embed,
-                    prefer_large_media=True,
-                    # превью (видео) над текстом — подпись оказывается снизу
-                    show_above_text=True,
-                ),
-                reply_markup=_keyboard(fixed),
-                disable_notification=True,
-            )
-        except Exception:  # noqa: BLE001
-            sent_all = False
-            log.exception("Не удалось отправить сообщение с превью")
+        text = _build_text(fixed, meta, sender)
+        sent = False
+
+        # Основной путь: настоящее видео-сообщение (sendVideo по прямому URL).
+        # Надёжнее превью: не зависит от кэша веб-превью Telegram.
+        video_url = await _resolve_video(fixed)
+        if video_url:
+            try:
+                await message.answer_video(
+                    video=video_url,
+                    caption=text,
+                    reply_markup=_keyboard(fixed),
+                    disable_notification=True,
+                )
+                sent = True
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "sendVideo не прошёл (%s, >20МБ или недоступен) — откат на превью",
+                    fixed.platform,
+                )
+
+        # Fallback: сообщение с веб-превью (без лимита 20 МБ)
+        if not sent:
+            try:
+                await message.answer(
+                    text,
+                    link_preview_options=LinkPreviewOptions(
+                        url=fixed.embed,
+                        prefer_large_media=True,
+                        show_above_text=True,
+                    ),
+                    reply_markup=_keyboard(fixed),
+                    disable_notification=True,
+                )
+                sent = True
+            except Exception:  # noqa: BLE001
+                sent_all = False
+                log.exception("Не удалось отправить сообщение с превью")
 
     # Удаляем оригинал только если все замены дошли
     if sent_all:
