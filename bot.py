@@ -129,6 +129,7 @@ async def _resolve_video(fixed: FixedLink) -> str | None:
     if _http is None:
         return None
     for url in fixed.candidates:
+        netloc = urlsplit(url).netloc
         try:
             async with _http.get(
                 url,
@@ -139,16 +140,23 @@ async def _resolve_video(fixed: FixedLink) -> str | None:
             ) as resp:
                 loc = resp.headers.get("Location", "")
                 if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
+                    log.info("resolve %s: redirect → видео найдено", netloc)
                     return loc
                 if resp.status == 200 and "html" in resp.headers.get("Content-Type", ""):
                     html_text = (await resp.content.read(262_144)).decode("utf-8", "ignore")
                     for pat in _OG_VIDEO_PATTERNS:
                         m = pat.search(html_text)
                         if m and m.group(1).startswith("http"):
+                            log.info("resolve %s: og:video → видео найдено", netloc)
                             return unescape(m.group(1))
+                log.info(
+                    "resolve %s: status=%s type=%s — видео не отдал",
+                    netloc, resp.status, resp.headers.get("Content-Type", "?"),
+                )
         except Exception as e:  # noqa: BLE001
-            log.info("Фиксер %s не ответил: %s — пробую следующий", urlsplit(url).netloc, e)
+            log.info("resolve %s: ошибка %s — пробую следующий", netloc, e)
             continue
+    log.warning("Видео не найдено ни у одного фиксера: %s", fixed.original)
     return None
 
 
@@ -303,10 +311,10 @@ async def on_message(message: Message, bot: Bot) -> None:
         return
 
     log.info(
-        "chat=%s user=%s links=%d",
+        "chat=%s user=%s links=%s",
         message.chat.id,
         message.from_user.id if message.from_user else "?",
-        len(links),
+        [f.original for f in links],
     )
 
     # Режим «заменить»: бот шлёт видео с подписью и кнопкой-ссылкой,
