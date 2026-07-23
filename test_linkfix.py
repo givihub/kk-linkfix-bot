@@ -50,13 +50,13 @@ def test_tiktok_root_ignored():
 def test_x_status():
     r = convert("https://x.com/elonmusk/status/1234567890123456789")
     assert r.original == "https://x.com/elonmusk/status/1234567890123456789"
-    assert r.embed == "https://fixupx.com/elonmusk/status/1234567890123456789"
+    assert r.embed == "https://d.fixupx.com/elonmusk/status/1234567890123456789"
     assert r.platform == "x" and r.label == "𝕏"
 
 
 def test_twitter_legacy_domain():
     r = convert("https://twitter.com/user/status/111?s=20")
-    assert r.embed == "https://fixupx.com/user/status/111"
+    assert r.embed == "https://d.fixupx.com/user/status/111"
     assert r.original == "https://x.com/user/status/111"
 
 

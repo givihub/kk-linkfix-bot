@@ -83,15 +83,18 @@ def convert(url: str) -> FixedLink | None:
         )
 
     # --- X / Twitter --------------------------------------------------------
+    # embed идёт на медиа-поддомен d.* (только видео, без текста в превью) —
+    # текст твита бот добавляет сам в тело сообщения (его можно переводить).
     if host in (
         "x.com", "twitter.com", "mobile.twitter.com", "mobile.x.com",
-        TWITTER_FIX_DOMAIN, "fxtwitter.com", "vxtwitter.com", "fixupx.com",
+        TWITTER_FIX_DOMAIN, f"d.{TWITTER_FIX_DOMAIN}",
+        "fxtwitter.com", "vxtwitter.com", "fixupx.com",
     ):
         if "/status/" not in path:
             return None
         return FixedLink(
             original=f"https://x.com{path}",
-            embed=f"https://{TWITTER_FIX_DOMAIN}{path}",
+            embed=f"https://d.{TWITTER_FIX_DOMAIN}{path}",
             platform="x",
         )
 
