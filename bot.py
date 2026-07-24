@@ -187,6 +187,11 @@ async def _fetch_media(fixed: FixedLink) -> tuple[str, bytes] | None:
             continue
         data = await _download_video(media_url)
         if not data:
+            # у некоторых фиксеров (vxinstagram) файл генерируется с задержкой —
+            # одна повторная попытка после короткой паузы
+            await asyncio.sleep(2.5)
+            data = await _download_video(media_url)
+        if not data:
             continue
         kind = _media_kind(data)
         if kind == "video":
