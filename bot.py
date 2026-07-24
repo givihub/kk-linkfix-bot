@@ -131,47 +131,72 @@ _OG_VIDEO_PATTERNS = (
 )
 
 
-async def _resolve_video(fixed: FixedLink) -> str | None:
-    """Прямой URL видеофайла. Перебирает цепочку доменов-фиксеров:
-    понимает и redirect на mp4 (kk*), и og:video на странице (tnktok, vxinstagram).
-    None = ни один фиксер не отдал видео."""
+async def _probe_candidate(url: str) -> str | None:
+    """Спросить у одного фиксера прямой URL медиа (redirect или og:video)."""
+    netloc = urlsplit(url).netloc
+    try:
+        async with _http.get(
+            url,
+            proxy=PROXY_URL,
+            allow_redirects=False,
+            headers=_UA,
+            timeout=aiohttp.ClientTimeout(total=6),
+        ) as resp:
+            loc = resp.headers.get("Location", "")
+            if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
+                if _is_platform_host(loc):
+                    log.info("probe %s: redirect обратно на соцсеть — мимо", netloc)
+                    return None
+                log.info("probe %s: redirect → медиа", netloc)
+                return loc
+            if resp.status == 200 and "html" in resp.headers.get("Content-Type", ""):
+                html_text = (await resp.content.read(262_144)).decode("utf-8", "ignore")
+                for pat in _OG_VIDEO_PATTERNS:
+                    m = pat.search(html_text)
+                    if m and m.group(1).startswith("http"):
+                        log.info("probe %s: og:video → медиа", netloc)
+                        return unescape(m.group(1))
+            log.info(
+                "probe %s: status=%s type=%s — медиа не отдал",
+                netloc, resp.status, resp.headers.get("Content-Type", "?"),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.info("probe %s: ошибка %s", netloc, e)
+    return None
+
+
+def _media_kind(data: bytes) -> str | None:
+    """video | photo | None по сигнатуре файла."""
+    head = bytes(data[:64])
+    if b"ftyp" in head:
+        return "video"
+    if head[:3] == b"\xff\xd8\xff" or head[:8] == b"\x89PNG\r\n\x1a\n" or head[:4] == b"RIFF":
+        return "photo"
+    return None
+
+
+async def _fetch_media(fixed: FixedLink) -> tuple[str, bytes] | None:
+    """Перебрать всю цепочку фиксеров. Приоритет — видео; если видео нет
+    нигде, но кто-то отдал картинку (фото-пост) — вернём её."""
     if _http is None:
         return None
+    photo: bytes | None = None
     for url in fixed.candidates:
-        netloc = urlsplit(url).netloc
-        try:
-            async with _http.get(
-                url,
-                proxy=PROXY_URL,
-                allow_redirects=False,
-                headers=_UA,
-                timeout=aiohttp.ClientTimeout(total=6),
-            ) as resp:
-                loc = resp.headers.get("Location", "")
-                if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
-                    if _is_platform_host(loc):
-                        log.info(
-                            "resolve %s: redirect обратно на соцсеть — не видео, дальше",
-                            netloc,
-                        )
-                        continue
-                    log.info("resolve %s: redirect → видео найдено", netloc)
-                    return loc
-                if resp.status == 200 and "html" in resp.headers.get("Content-Type", ""):
-                    html_text = (await resp.content.read(262_144)).decode("utf-8", "ignore")
-                    for pat in _OG_VIDEO_PATTERNS:
-                        m = pat.search(html_text)
-                        if m and m.group(1).startswith("http"):
-                            log.info("resolve %s: og:video → видео найдено", netloc)
-                            return unescape(m.group(1))
-                log.info(
-                    "resolve %s: status=%s type=%s — видео не отдал",
-                    netloc, resp.status, resp.headers.get("Content-Type", "?"),
-                )
-        except Exception as e:  # noqa: BLE001
-            log.info("resolve %s: ошибка %s — пробую следующий", netloc, e)
+        media_url = await _probe_candidate(url)
+        if not media_url:
             continue
-    log.warning("Видео не найдено ни у одного фиксера: %s", fixed.original)
+        data = await _download_video(media_url)
+        if not data:
+            continue
+        kind = _media_kind(data)
+        if kind == "video":
+            return "video", data
+        if kind == "photo" and photo is None:
+            log.info("Фиксер %s отдал картинку — запомню, ищу видео дальше", urlsplit(url).netloc)
+            photo = data
+    if photo is not None:
+        return "photo", photo
+    log.warning("Медиа не найдено ни у одного фиксера: %s", fixed.original)
     return None
 
 
@@ -198,9 +223,9 @@ async def _download_video(url: str) -> bytes | None:
                 if len(buf) > _MAX_VIDEO:
                     log.warning("Видео превысило лимит %d МБ при скачивании", _MAX_VIDEO // 1048576)
                     return None
-            # Санити-чек: это точно mp4, а не HTML-страница/ошибка
-            if len(buf) < 10_000 or b"ftyp" not in bytes(buf[:64]):
-                log.warning("Скачанное не похоже на видео (%d байт) — отбрасываю", len(buf))
+            # Минимальный санити-чек: не пустышка и не страница ошибки
+            if len(buf) < 5_000:
+                log.warning("Скачанное подозрительно мало (%d байт) — отбрасываю", len(buf))
                 return None
             return bytes(buf)
     except Exception as e:  # noqa: BLE001
@@ -348,20 +373,20 @@ async def on_message(message: Message, bot: Bot) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-        # Текст поста и резолв видео — параллельно (экономит до ~4 с)
+        # Текст поста и поиск медиа — параллельно (экономит до ~4 с)
         meta_task = asyncio.create_task(_fetch_meta(fixed))
-        video_url = await _resolve_video(fixed)
+        media = await _fetch_media(fixed)
         meta = await meta_task
         text = _build_text(fixed, meta, sender)
         sent = False
 
-        # Основной путь: скачать видео через прокси и загрузить в Telegram
-        # как файл — не зависит ни от кэша превью, ни от блокировок CDN.
-        if video_url:
-            data = await _download_video(video_url)
-            if data:
-                data, vmeta, thumb = await _prepare_video(data)
-                try:
+        # Основной путь: скачанное медиа загружаем в Telegram файлом —
+        # не зависит ни от кэша превью, ни от блокировок CDN.
+        if media:
+            kind, data = media
+            try:
+                if kind == "video":
+                    data, vmeta, thumb = await _prepare_video(data)
                     await message.answer_video(
                         video=BufferedInputFile(data, filename="video.mp4"),
                         caption=text,
@@ -374,13 +399,22 @@ async def on_message(message: Message, bot: Bot) -> None:
                         thumbnail=BufferedInputFile(thumb, "thumb.jpg") if thumb else None,
                         request_timeout=300,
                     )
-                    sent = True
-                except Exception as e:  # noqa: BLE001
-                    log.warning(
-                        "Загрузка видео в Telegram не прошла (%s): %s — откат на превью",
-                        fixed.platform,
-                        e,
+                else:  # photo — фото-пост без видео
+                    await message.answer_photo(
+                        photo=BufferedInputFile(data, filename="photo.jpg"),
+                        caption=text,
+                        reply_markup=_keyboard(fixed),
+                        disable_notification=True,
+                        request_timeout=120,
                     )
+                sent = True
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "Загрузка медиа в Telegram не прошла (%s, %s): %s — откат на превью",
+                    fixed.platform,
+                    kind,
+                    e,
+                )
 
         # Fallback: сообщение с веб-превью (без лимита 45 МБ)
         if not sent:
