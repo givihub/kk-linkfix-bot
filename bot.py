@@ -302,7 +302,7 @@ def _sender_mention(message: Message) -> str:
     return f'<a href="tg://user?id={u.id}">{escape(u.full_name)}</a>'
 
 
-def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str) -> str:
+def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str | None) -> str:
     lines: list[str] = []
     title = meta.get("title", "").strip()
     if title:
@@ -314,7 +314,10 @@ def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str) -> str:
         if len(desc) > 750:  # лимит подписи к видео — 1024 видимых символа
             desc = desc[:749] + "…"
         lines.append(f"<blockquote expandable>{escape(desc)}</blockquote>")
-    lines.append(f"👤 от {sender}")
+    if sender:  # в личке с ботом подпись «от кого» не нужна
+        lines.append(f"👤 от {sender}")
+    if not lines:
+        lines.append(f"<b>{fixed.label}</b>")
     return "\n".join(lines)
 
 
@@ -368,7 +371,10 @@ async def on_message(message: Message, bot: Bot) -> None:
 
     # Режим «заменить»: бот шлёт видео с подписью и кнопкой-ссылкой,
     # затем удаляет исходное сообщение (если хватает прав).
-    sender = _sender_mention(message)
+    # В группах подписываем автора ссылки; в личке с ботом — не нужно
+    sender = (
+        _sender_mention(message) if message.chat.type != ChatType.PRIVATE else None
+    )
     sent_all = True
     all_video = True  # оригинал удаляем только если видео реально доставлено
     for fixed in links:
