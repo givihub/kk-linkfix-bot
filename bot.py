@@ -36,9 +36,17 @@ from aiogram.types import (
 
 from linkfix import FixedLink, convert
 
+_log_handlers: list[logging.Handler] = [logging.StreamHandler()]
+if os.path.isdir("/logs"):  # примонтированный каталог — логи переживают пересборку
+    from logging.handlers import RotatingFileHandler
+
+    _log_handlers.append(
+        RotatingFileHandler("/logs/bot.log", maxBytes=5_000_000, backupCount=3)
+    )
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=_log_handlers,
 )
 log = logging.getLogger("kk-linkfix-bot")
 
@@ -386,6 +394,10 @@ async def on_message(message: Message, bot: Bot) -> None:
         # Текст поста и поиск медиа — параллельно (экономит до ~4 с)
         meta_task = asyncio.create_task(_fetch_meta(fixed))
         media = await _fetch_media(fixed)
+        if media is None:
+            # у фиксеров бывают транзиентные 5xx — второй проход цепочки
+            await asyncio.sleep(4)
+            media = await _fetch_media(fixed)
         meta = await meta_task
         text = _build_text(fixed, meta, sender)
         sent = False
