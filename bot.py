@@ -316,8 +316,7 @@ def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str | None) -> s
         lines.append(f"<blockquote expandable>{escape(desc)}</blockquote>")
     if sender:  # в личке с ботом подпись «от кого» не нужна
         lines.append(f"👤 от {sender}")
-    if not lines:
-        lines.append(f"<b>{fixed.label}</b>")
+    # Пустая строка допустима: у видео/фото подпись опциональна
     return "\n".join(lines)
 
 
@@ -400,7 +399,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                     data, vmeta, thumb = await _prepare_video(data)
                     await message.answer_video(
                         video=BufferedInputFile(data, filename="video.mp4"),
-                        caption=text,
+                        caption=text or None,
                         reply_markup=_keyboard(fixed),
                         disable_notification=True,
                         supports_streaming=True,
@@ -413,7 +412,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                 else:  # photo — фото-пост без видео
                     await message.answer_photo(
                         photo=BufferedInputFile(data, filename="photo.jpg"),
-                        caption=text,
+                        caption=text or None,
                         reply_markup=_keyboard(fixed),
                         disable_notification=True,
                         request_timeout=120,
@@ -432,7 +431,8 @@ async def on_message(message: Message, bot: Bot) -> None:
             all_video = False
             try:
                 await message.answer(
-                    text,
+                    # текстовое сообщение пустым быть не может — минимум название
+                    text or f"<b>{fixed.label}</b>",
                     link_preview_options=LinkPreviewOptions(
                         url=fixed.embed,
                         prefer_large_media=True,
