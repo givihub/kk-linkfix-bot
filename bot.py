@@ -213,6 +213,58 @@ async def _fetch_media(fixed: FixedLink) -> tuple[str, bytes] | None:
     return None
 
 
+# Признаки «контент закрыт владельцем / нужен логин» в ошибках yt-dlp
+_RESTRICTED_MARKERS = (
+    "cookies", "login", "logged-in", "logged in", "empty media response",
+    "age-restricted", "restricted video", "private", "registered users",
+    "rate-limit reached or login required",
+)
+
+
+async def _ytdlp_fetch(url: str) -> tuple[tuple[str, bytes] | None, bool]:
+    """Последний рубеж: yt-dlp напрямую с платформы (без авторизации).
+
+    Возвращает (media, restricted): media = ("video", bytes) при успехе;
+    restricted=True, если контент закрыт владельцем / требует логина.
+    """
+    try:
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            out = os.path.join(td, "v.mp4")
+            cmd = [
+                "yt-dlp", "-q", "--no-warnings", "--no-playlist",
+                "--max-filesize", "45M",
+                "-f", "b[ext=mp4]/b",
+                "--merge-output-format", "mp4",
+                "-o", out,
+                url,
+            ]
+            if PROXY_URL:
+                cmd += ["--proxy", PROXY_URL]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                proc.kill()
+                log.warning("yt-dlp: таймаут")
+                return None, False
+            if os.path.exists(out) and os.path.getsize(out) > 10_000:
+                with open(out, "rb") as f:
+                    data = f.read()
+                log.info("yt-dlp: видео добыто напрямую (%d КБ)", len(data) // 1024)
+                return ("video", data), False
+            err_text = (err or b"").decode("utf-8", "ignore").lower()
+            restricted = any(m in err_text for m in _RESTRICTED_MARKERS)
+            log.info("yt-dlp: не вышло (restricted=%s): %s", restricted, err_text[-250:])
+            return None, restricted
+    except Exception as e:  # noqa: BLE001
+        log.warning("yt-dlp: ошибка запуска: %s", e)
+        return None, False
+
+
 async def _download_video(url: str) -> bytes | None:
     """Скачать видеофайл (в память, до 45 МБ). None при любой ошибке."""
     if _http is None:
@@ -398,6 +450,10 @@ async def on_message(message: Message, bot: Bot) -> None:
             # у фиксеров бывают транзиентные 5xx — второй проход цепочки
             await asyncio.sleep(4)
             media = await _fetch_media(fixed)
+        restricted = False
+        if media is None:
+            # последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров
+            media, restricted = await _ytdlp_fetch(fixed.original)
         meta = await meta_task
         text = _build_text(fixed, meta, sender)
         sent = False
@@ -437,6 +493,22 @@ async def on_message(message: Message, bot: Bot) -> None:
                     kind,
                     e,
                 )
+
+        # Контент закрыт владельцем: честно сообщаем, оригинал не трогаем
+        if not sent and restricted:
+            all_video = False
+            try:
+                await message.reply(
+                    "🔒 Владелец закрыл это видео — платформа показывает его "
+                    "только авторизованным пользователям, бот бессилен. "
+                    "Открыть можно по кнопке.",
+                    reply_markup=_keyboard(fixed),
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    disable_notification=True,
+                )
+                sent = True
+            except Exception:  # noqa: BLE001
+                log.exception("Не удалось отправить сообщение об ограничении")
 
         # Fallback: сообщение с веб-превью (без лимита 45 МБ)
         if not sent:
