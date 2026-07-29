@@ -451,9 +451,13 @@ async def on_message(message: Message, bot: Bot) -> None:
             await asyncio.sleep(4)
             media = await _fetch_media(fixed)
         restricted = False
-        if media is None:
-            # последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров
-            media, restricted = await _ytdlp_fetch(fixed.original)
+        if media is None or media[0] == "photo":
+            # Последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров.
+            # Запускаем и когда фиксеры нашли только картинку: возможно,
+            # это видео-пост, у которого фиксеры видят лишь обложку.
+            yt_media, restricted = await _ytdlp_fetch(fixed.original)
+            if yt_media is not None:
+                media = yt_media  # видео побеждает фото
         meta = await meta_task
         text = _build_text(fixed, meta, sender)
         sent = False
