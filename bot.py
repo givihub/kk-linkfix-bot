@@ -218,6 +218,8 @@ _RESTRICTED_MARKERS = (
     "cookies", "login", "logged-in", "logged in", "empty media response",
     "age-restricted", "restricted video", "private", "registered users",
     "rate-limit reached or login required",
+    "isn't available to everyone", "certain audiences",
+    "not available to everyone",
 )
 
 
