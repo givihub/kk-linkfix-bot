@@ -51,4 +51,4 @@ python3 test_linkfix.py
 
 ## Деплой (текущий прод)
 
-Сервер FreeTier (Cloud.ru), каталог `/opt/kk-linkfix-bot`, Telegram API — через локальный Xray-прокси `http://127.0.0.1:7890`. Меры безопасности — см. [DEVSECOPS.md](DEVSECOPS.md).
+Сервер **GiviSRV3** (домашний Beelink Mini S), каталог `~/apps/kk-linkfix-bot`. Прокси не используется — из домашней сети Telegram API и CDN платформ доступны напрямую (`PROXY_URL` пуст). До 2026-08-09 бот жил на FreeTier (Cloud.ru) с Xray-прокси; там оставлена остановленная копия как холодный резерв. Меры безопасности — см. [DEVSECOPS.md](DEVSECOPS.md).
