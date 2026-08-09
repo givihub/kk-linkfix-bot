@@ -235,7 +235,9 @@ async def _ytdlp_fetch(url: str) -> tuple[tuple[str, bytes] | None, bool]:
             cmd = [
                 "yt-dlp", "-q", "--no-warnings", "--no-playlist",
                 "--max-filesize", "45M",
-                "-f", "b[ext=mp4]/b",
+                # предпочтения: до 720p, кодек h264 (совместим с iOS-Telegram);
+                # видео+звук склеиваются ffmpeg'ом при раздельных дорожках (DASH)
+                "-S", "res:720,vcodec:h264",
                 "--merge-output-format", "mp4",
                 "-o", out,
                 url,
@@ -553,7 +555,12 @@ async def main() -> None:
     if not token:
         raise SystemExit("BOT_TOKEN не задан (см. .env.example)")
 
-    session = AiohttpSession(proxy=PROXY_URL) if PROXY_URL else None
+    # timeout=300: загрузка больших видео через прокси не влезает в дефолтные 60 с
+    session = (
+        AiohttpSession(proxy=PROXY_URL, timeout=300)
+        if PROXY_URL
+        else AiohttpSession(timeout=300)
+    )
     if PROXY_URL:
         log.info("Работаю через прокси: %s", PROXY_URL)
 
