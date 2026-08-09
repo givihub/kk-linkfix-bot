@@ -326,9 +326,25 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
             th = os.path.join(td, "thumb.jpg")
             with open(src, "wb") as f:
                 f.write(data)
-            rc, _ = await _run(
-                ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst]
+            # Кодек видеодорожки: клиенты Telegram играют только h264 в mp4.
+            # VP9/AV1 (частый случай у yt-dlp/DASH) — статичный кадр со звуком.
+            rc, out = await _run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", src]
             )
+            codec = out.decode("utf-8", "ignore").strip().lower() if rc == 0 else ""
+            if codec and codec != "h264":
+                log.info("Кодек %s — перекодирую в h264 для совместимости", codec)
+                rc, _ = await _run(
+                    ["ffmpeg", "-y", "-i", src,
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                     "-c:a", "aac", "-b:a", "128k",
+                     "-movflags", "+faststart", dst]
+                )
+            else:
+                rc, _ = await _run(
+                    ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst]
+                )
             target = dst if rc == 0 and os.path.getsize(dst) > 0 else src
             if target == dst:
                 with open(dst, "rb") as f:
