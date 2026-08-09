@@ -334,10 +334,24 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
             )
             codec = out.decode("utf-8", "ignore").strip().lower() if rc == 0 else ""
             if codec and codec != "h264":
-                log.info("Кодек %s — перекодирую в h264 для совместимости", codec)
+                # Потолок битрейта из длительности: файл должен влезть в 45 МБ
+                rc, out = await _run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", src]
+                )
+                try:
+                    dur = float(out.decode().strip()) if rc == 0 else 0.0
+                except ValueError:
+                    dur = 0.0
+                kbps = 2500
+                if dur > 1:
+                    cap = int(_MAX_VIDEO * 8 * 0.9 / dur / 1000) - 128
+                    kbps = max(300, min(2500, cap))
+                log.info("Кодек %s — перекодирую в h264 (%d kbps, %.0f c)", codec, kbps, dur)
                 rc, _ = await _run(
                     ["ffmpeg", "-y", "-i", src,
-                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                     "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k",
                      "-c:a", "aac", "-b:a", "128k",
                      "-movflags", "+faststart", dst]
                 )
