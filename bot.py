@@ -25,6 +25,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatType, MessageEntityType, ParseMode
 from aiogram.types import (
     BufferedInputFile,
@@ -67,7 +68,13 @@ _BROWSER_UA = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 }
-_MAX_VIDEO = 45 * 1024 * 1024  # 45 МБ (лимит загрузки ботом — 50 МБ)
+# Лимит размера видео. Облачный Bot API: 45 (потолок Telegram — 50 МБ).
+# С локальным Bot API сервером (BOT_API_URL) можно ставить до ~1900.
+_MAX_VIDEO = int(os.getenv("MAX_VIDEO_MB", "45")) * 1024 * 1024
+# Локальный Bot API сервер (пусто = облачный api.telegram.org)
+BOT_API_URL = os.getenv("BOT_API_URL") or None
+# Предпочтения качества yt-dlp
+_YTDLP_SORT = os.getenv("YTDLP_SORT", "res:1080,vcodec:h264")
 _OG_PATTERNS = (
     re.compile(
         r'<meta[^>]*?property=["\']og:(title|description)["\'][^>]*?content=["\']([^"\']*)',
@@ -234,12 +241,10 @@ async def _ytdlp_fetch(url: str) -> tuple[tuple[str, bytes] | None, bool]:
             out = os.path.join(td, "v.mp4")
             cmd = [
                 "yt-dlp", "-q", "--no-warnings", "--no-playlist",
-                # 200M: длинные ролики скачиваем целиком, во вписывание в лимит
-                # Telegram их пережмёт _prepare_video (битрейт из длительности)
-                "--max-filesize", "200M",
-                # предпочтения: до 720p, кодек h264 (совместим с iOS-Telegram);
+                "--max-filesize", f"{max(_MAX_VIDEO // 1048576, 200)}M",
+                # качество из _YTDLP_SORT (по умолчанию до 1080p, кодек h264);
                 # видео+звук склеиваются ffmpeg'ом при раздельных дорожках (DASH)
-                "-S", "res:720,vcodec:h264",
+                "-S", _YTDLP_SORT,
                 "--merge-output-format", "mp4",
                 "-o", out,
                 url,
@@ -346,14 +351,14 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
                     dur = float(out.decode().strip()) if rc == 0 else 0.0
                 except ValueError:
                     dur = 0.0
-                kbps = 2500
+                kbps = 6000
                 if dur > 1:
                     cap = int(_MAX_VIDEO * 8 * 0.9 / dur / 1000) - 128
-                    kbps = max(300, min(2500, cap))
+                    kbps = max(300, min(6000, cap))
                 log.info("Кодек %s — перекодирую в h264 (%d kbps, %.0f c)", codec, kbps, dur)
                 rc, _ = await _run(
                     ["ffmpeg", "-y", "-i", src,
-                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                      "-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k",
                      "-c:a", "aac", "-b:a", "128k",
                      "-movflags", "+faststart", dst]
@@ -588,14 +593,16 @@ async def main() -> None:
     if not token:
         raise SystemExit("BOT_TOKEN не задан (см. .env.example)")
 
-    # timeout=300: загрузка больших видео через прокси не влезает в дефолтные 60 с
-    session = (
-        AiohttpSession(proxy=PROXY_URL, timeout=300)
-        if PROXY_URL
-        else AiohttpSession(timeout=300)
-    )
+    # Большой таймаут: загрузка крупных видео не влезает в дефолтные 60 с
+    session_kwargs: dict = {"timeout": 900 if BOT_API_URL else 300}
     if PROXY_URL:
+        session_kwargs["proxy"] = PROXY_URL
         log.info("Работаю через прокси: %s", PROXY_URL)
+    if BOT_API_URL:
+        # Локальный Bot API сервер: лимит загрузки 2 ГБ вместо 50 МБ
+        session_kwargs["api"] = TelegramAPIServer.from_base(BOT_API_URL, is_local=True)
+        log.info("Работаю через локальный Bot API: %s", BOT_API_URL)
+    session = AiohttpSession(**session_kwargs)
 
     bot = Bot(
         token=token,

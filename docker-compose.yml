@@ -22,3 +22,23 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Локальный Telegram Bot API сервер: снимает лимит 50 МБ (даёт до 2 ГБ).
+  # Нужны TELEGRAM_API_ID / TELEGRAM_API_HASH в .env (my.telegram.org).
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    profiles: ["local-api"]  # стартует только явно: docker compose --profile local-api up -d
+    restart: unless-stopped
+    network_mode: host   # слушает 127.0.0.1:8081, наружу не торчит
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_LOCAL: 1
+    volumes:
+      - ./tgapi-data:/var/lib/telegram-bot-api
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
