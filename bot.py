@@ -234,7 +234,9 @@ async def _ytdlp_fetch(url: str) -> tuple[tuple[str, bytes] | None, bool]:
             out = os.path.join(td, "v.mp4")
             cmd = [
                 "yt-dlp", "-q", "--no-warnings", "--no-playlist",
-                "--max-filesize", "45M",
+                # 200M: длинные ролики скачиваем целиком, во вписывание в лимит
+                # Telegram их пережмёт _prepare_video (битрейт из длительности)
+                "--max-filesize", "200M",
                 # предпочтения: до 720p, кодек h264 (совместим с iOS-Telegram);
                 # видео+звук склеиваются ffmpeg'ом при раздельных дорожках (DASH)
                 "-S", "res:720,vcodec:h264",
@@ -333,7 +335,8 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
                  "-show_entries", "stream=codec_name", "-of", "csv=p=0", src]
             )
             codec = out.decode("utf-8", "ignore").strip().lower() if rc == 0 else ""
-            if codec and codec != "h264":
+            # Перекодируем, если кодек несовместим ИЛИ файл не влезает в лимит
+            if (codec and codec != "h264") or len(data) > _MAX_VIDEO:
                 # Потолок битрейта из длительности: файл должен влезть в 45 МБ
                 rc, out = await _run(
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration",
