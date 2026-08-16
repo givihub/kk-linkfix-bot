@@ -17,7 +17,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import tempfile
+from collections import OrderedDict
 from html import escape, unescape
 from urllib.parse import urlsplit, urlunsplit
 
@@ -29,6 +31,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatType, MessageEntityType, ParseMode
 from aiogram.types import (
     BufferedInputFile,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -74,7 +77,7 @@ _MAX_VIDEO = int(os.getenv("MAX_VIDEO_MB", "45")) * 1024 * 1024
 # Локальный Bot API сервер (пусто = облачный api.telegram.org)
 BOT_API_URL = os.getenv("BOT_API_URL") or None
 # Предпочтения качества yt-dlp
-_YTDLP_SORT = os.getenv("YTDLP_SORT", "res:1080,vcodec:h264")
+_YTDLP_SORT = os.getenv("YTDLP_SORT", "res:720,vcodec:h264")
 _OG_PATTERNS = (
     re.compile(
         r'<meta[^>]*?property=["\']og:(title|description)["\'][^>]*?content=["\']([^"\']*)',
@@ -422,15 +425,73 @@ def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str | None) -> s
     return "\n".join(lines)
 
 
-def _keyboard(fixed: FixedLink) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
+# Кэш «кнопка → ссылка» для извлечения звука (callback_data ограничена 64 байтами)
+_AUDIO_CACHE: OrderedDict[str, str] = OrderedDict()
+
+
+def _remember_audio(url: str) -> str:
+    key = secrets.token_urlsafe(6)
+    _AUDIO_CACHE[key] = url
+    while len(_AUDIO_CACHE) > 500:
+        _AUDIO_CACHE.popitem(last=False)
+    return key
+
+
+def _keyboard(fixed: FixedLink, with_audio: bool = False) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton(text=f"{fixed.label} ↗", url=fixed.original)]
+    if with_audio:
+        row.append(
             InlineKeyboardButton(
-                text=f"{fixed.label} ↗",
-                url=fixed.original,
+                text="🎵 Звук",
+                callback_data=f"aud:{_remember_audio(fixed.original)}",
             )
-        ]]
-    )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+async def _ytdlp_audio(url: str) -> bytes | None:
+    """Достать аудиодорожку (mp3) через yt-dlp. None при ошибке."""
+    try:
+        with tempfile.TemporaryDirectory(dir="/tmp") as td:
+            out = os.path.join(td, "a.%(ext)s")
+            cmd = [
+                "yt-dlp", "-q", "--no-warnings", "--no-playlist",
+                "--max-filesize", "200M",
+                "-x", "--audio-format", "mp3", "--audio-quality", "192K",
+                "-o", out, url,
+            ]
+            if PROXY_URL:
+                cmd += ["--proxy", PROXY_URL]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=300)
+            except asyncio.TimeoutError:
+                proc.kill()
+                return None
+            p = os.path.join(td, "a.mp3")
+            if os.path.exists(p) and os.path.getsize(p) > 10_000:
+                with open(p, "rb") as f:
+                    return f.read()
+    except Exception as e:  # noqa: BLE001
+        log.warning("yt-dlp audio: %s", e)
+    return None
+
+
+async def _expand_playlist(url: str) -> list[str]:
+    """Первые 10 роликов плейлиста YouTube (только для лички)."""
+    cmd = ["yt-dlp", "-q", "--no-warnings", "--flat-playlist",
+           "--playlist-end", "10", "--print", "url", url]
+    if PROXY_URL:
+        cmd += ["--proxy", PROXY_URL]
+    rc, out = await _run(cmd)
+    urls = [l.strip() for l in out.decode("utf-8", "ignore").splitlines()
+            if l.strip().startswith("http")]
+    log.info("Плейлист: беру %d роликов (лимит 10)", len(urls))
+    return urls
 
 
 def _extract_links(message: Message) -> list[FixedLink]:
@@ -460,6 +521,21 @@ async def on_message(message: Message, bot: Bot) -> None:
     if message.from_user and message.from_user.is_bot:
         return
     links = _extract_links(message)
+    is_private = message.chat.type == ChatType.PRIVATE
+
+    # YouTube — только в личке: в группах Telegram сам играет его нативно
+    links = [f for f in links if f.platform != "youtube" or is_private]
+
+    # Плейлисты YouTube — только в личке, первые 10 роликов
+    if is_private:
+        text_all = message.text or message.caption or ""
+        m = re.search(r"https?://\S*youtube\.com/playlist\?\S+", text_all)
+        if m:
+            for u in await _expand_playlist(m.group(0)):
+                fx = convert(u)
+                if fx and fx.embed not in {f.embed for f in links}:
+                    links.append(fx)
+
     if not links:
         return
 
@@ -514,7 +590,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                     await message.answer_video(
                         video=BufferedInputFile(data, filename="video.mp4"),
                         caption=text or None,
-                        reply_markup=_keyboard(fixed),
+                        reply_markup=_keyboard(fixed, with_audio=True),
                         disable_notification=True,
                         supports_streaming=True,
                         width=vmeta.get("width"),
@@ -588,6 +664,39 @@ async def on_message(message: Message, bot: Bot) -> None:
             )
 
 
+@router.callback_query(F.data.startswith("aud:"))
+async def on_audio_button(cb: CallbackQuery, bot: Bot) -> None:
+    """Кнопка «🎵 Звук»: достаём аудиодорожку и шлём ответом на видео."""
+    url = _AUDIO_CACHE.get((cb.data or "")[4:])
+    if not url or cb.message is None:
+        await cb.answer("Кнопка устарела — киньте ссылку ещё раз", show_alert=True)
+        return
+    await cb.answer("Достаю звук…")
+    try:
+        await bot.send_chat_action(cb.message.chat.id, "upload_document")
+    except Exception:  # noqa: BLE001
+        pass
+    log.info("chat=%s: извлекаю аудио из %s", cb.message.chat.id, url)
+    data = await _ytdlp_audio(url)
+    if data:
+        try:
+            await cb.message.reply_audio(
+                audio=BufferedInputFile(data, filename="audio.mp3"),
+                disable_notification=True,
+                request_timeout=300,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить аудио")
+    try:
+        await cb.message.reply(
+            "🎵 Не смог достать звук из этого видео, увы",
+            disable_notification=True,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -618,7 +727,7 @@ async def main() -> None:
         me = await bot.get_me()
         log.info("Запущен как @%s (id=%s)", me.username, me.id)
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         await _http.close()
 

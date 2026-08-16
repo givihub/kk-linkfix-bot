@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 
 def _domains(env: str, default: str) -> list[str]:
@@ -21,6 +21,7 @@ FIX_DOMAINS: dict[str, list[str]] = {
     "instagram": _domains("INSTAGRAM_FIX_DOMAINS", "kkinstagram.com,vxinstagram.com"),
     "tiktok": _domains("TIKTOK_FIX_DOMAINS", "kktiktok.com,tnktok.com,a.tnktok.com"),
     "x": _domains("TWITTER_FIX_DOMAINS", "d.fixupx.com,d.fxtwitter.com,d.vxtwitter.com"),
+    "youtube": [],  # фиксеров нет — сразу yt-dlp
 }
 
 # Название источника для подписи под видео («𝕏» — юникод-логотип X)
@@ -28,6 +29,7 @@ LABEL = {
     "instagram": "Instagram",
     "tiktok": "TikTok",
     "x": "𝕏",
+    "youtube": "YouTube",
 }
 
 # Пути Instagram, у которых бывает видео-превью
@@ -115,5 +117,25 @@ def convert(url: str) -> FixedLink | None:
             embed=f"https://{FIX_DOMAINS['x'][0]}{path}",
             platform="x",
         )
+
+    # --- YouTube: бот обрабатывает только в личке (в группах — нативное превью)
+    if host in ("youtube.com", "m.youtube.com"):
+        if path.startswith("/shorts/"):
+            seg = path.split("/")
+            vid = seg[2] if len(seg) > 2 else ""
+            if vid:
+                u = f"https://www.youtube.com/shorts/{vid}"
+                return FixedLink(original=u, embed=u, platform="youtube")
+        if path.startswith("/watch"):
+            vid = parse_qs(parts.query).get("v", [""])[0]
+            if vid:
+                u = f"https://www.youtube.com/watch?v={vid}"
+                return FixedLink(original=u, embed=u, platform="youtube")
+        return None
+    if host == "youtu.be":
+        vid = path.strip("/").split("/")[0]
+        if vid:
+            u = f"https://www.youtube.com/watch?v={vid}"
+            return FixedLink(original=u, embed=u, platform="youtube")
 
     return None

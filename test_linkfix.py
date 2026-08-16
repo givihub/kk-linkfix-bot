@@ -69,6 +69,21 @@ def test_reddit_not_supported():
     assert convert("https://redd.it/abc123") is None
 
 
+def test_youtube_watch_and_short_links():
+    r = convert("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42")
+    assert r.platform == "youtube" and r.label == "YouTube"
+    assert r.original == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    r2 = convert("https://youtu.be/dQw4w9WgXcQ")
+    assert r2.original == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    r3 = convert("https://www.youtube.com/shorts/abc123XYZ")
+    assert r3.original == "https://www.youtube.com/shorts/abc123XYZ"
+    assert r3.candidates == []  # фиксеров нет — сразу yt-dlp
+
+
+def test_youtube_channel_ignored():
+    assert convert("https://www.youtube.com/@somechannel") is None
+
+
 def test_bare_url_without_scheme():
     r = convert("instagram.com/reel/XYZ/")
     assert r is not None and r.embed == "https://kkinstagram.com/reel/XYZ/"
@@ -76,7 +91,7 @@ def test_bare_url_without_scheme():
 
 def test_unrelated():
     assert convert("https://example.com/reel/nope/") is None
-    assert convert("https://youtube.com/watch?v=abc") is None
+    assert convert("https://vimeo.com/12345") is None
 
 
 if __name__ == "__main__":
