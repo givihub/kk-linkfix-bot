@@ -33,7 +33,8 @@ LABEL = {
 }
 
 # Пути Instagram, у которых бывает видео-превью
-_INSTA_PREFIXES = ("/reel/", "/reels/", "/p/", "/tv/")
+# (/stories/ — распознаём, но без авторизации их не достать: бот честно ответит)
+_INSTA_PREFIXES = ("/reel/", "/reels/", "/p/", "/tv/", "/stories/")
 
 
 @dataclass(frozen=True)

@@ -84,6 +84,12 @@ def test_youtube_channel_ignored():
     assert convert("https://www.youtube.com/@somechannel") is None
 
 
+def test_instagram_stories_recognized():
+    r = convert("https://www.instagram.com/stories/zamaznoy/3976550502804472623?utm_source=x")
+    assert r is not None and r.platform == "instagram"
+    assert r.original == "https://www.instagram.com/stories/zamaznoy/3976550502804472623"
+
+
 def test_bare_url_without_scheme():
     r = convert("instagram.com/reel/XYZ/")
     assert r is not None and r.embed == "https://kkinstagram.com/reel/XYZ/"
