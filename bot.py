@@ -20,8 +20,10 @@ import re
 import secrets
 import tempfile
 from collections import OrderedDict
+from datetime import datetime
 from html import escape, unescape
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -78,6 +80,18 @@ _MAX_VIDEO = int(os.getenv("MAX_VIDEO_MB", "45")) * 1024 * 1024
 BOT_API_URL = os.getenv("BOT_API_URL") or None
 # Предпочтения качества yt-dlp
 _YTDLP_SORT = os.getenv("YTDLP_SORT", "res:720,vcodec:h264")
+
+# Режим тишины: с QUIET_FROM до QUIET_TO часов (по QUIET_TZ) сообщения без звука
+_QUIET_TZ = ZoneInfo(os.getenv("QUIET_TZ", "Europe/Moscow"))
+_QUIET_FROM = int(os.getenv("QUIET_FROM", "23"))
+_QUIET_TO = int(os.getenv("QUIET_TO", "8"))
+
+
+def _silent_now() -> bool:
+    h = datetime.now(_QUIET_TZ).hour
+    if _QUIET_FROM > _QUIET_TO:  # интервал через полночь, напр. 23 → 8
+        return h >= _QUIET_FROM or h < _QUIET_TO
+    return _QUIET_FROM <= h < _QUIET_TO
 _OG_PATTERNS = (
     re.compile(
         r'<meta[^>]*?property=["\']og:(title|description)["\'][^>]*?content=["\']([^"\']*)',
@@ -591,7 +605,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                         video=BufferedInputFile(data, filename="video.mp4"),
                         caption=text or None,
                         reply_markup=_keyboard(fixed, with_audio=True),
-                        disable_notification=True,
+                        disable_notification=_silent_now(),
                         supports_streaming=True,
                         width=vmeta.get("width"),
                         height=vmeta.get("height"),
@@ -604,7 +618,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                         photo=BufferedInputFile(data, filename="photo.jpg"),
                         caption=text or None,
                         reply_markup=_keyboard(fixed),
-                        disable_notification=True,
+                        disable_notification=_silent_now(),
                         request_timeout=120,
                     )
                 sent = True
@@ -616,17 +630,22 @@ async def on_message(message: Message, bot: Bot) -> None:
                     e,
                 )
 
-        # Контент закрыт владельцем: честно сообщаем, оригинал не трогаем
+        # Контент закрыт владельцем: честно сообщаем (с автором ссылки),
+        # оригинал при этом удаляется как и при обычной замене
         if not sent and restricted:
-            all_video = False
             try:
-                await message.reply(
+                locked = (
                     "🔒 Владелец закрыл это видео — платформа показывает его "
                     "только авторизованным пользователям, бот бессилен. "
-                    "Открыть можно по кнопке.",
+                    "Открыть можно по кнопке."
+                )
+                if sender:
+                    locked += f"\n👤 от {sender}"
+                await message.answer(
+                    locked,
                     reply_markup=_keyboard(fixed),
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
-                    disable_notification=True,
+                    disable_notification=_silent_now(),
                 )
                 sent = True
             except Exception:  # noqa: BLE001
@@ -645,7 +664,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                         show_above_text=True,
                     ),
                     reply_markup=_keyboard(fixed),
-                    disable_notification=True,
+                    disable_notification=_silent_now(),
                 )
                 sent = True
             except Exception:  # noqa: BLE001
@@ -682,7 +701,7 @@ async def on_audio_button(cb: CallbackQuery, bot: Bot) -> None:
         try:
             await cb.message.reply_audio(
                 audio=BufferedInputFile(data, filename="audio.mp3"),
-                disable_notification=True,
+                disable_notification=_silent_now(),
                 request_timeout=300,
             )
             return
@@ -691,7 +710,7 @@ async def on_audio_button(cb: CallbackQuery, bot: Bot) -> None:
     try:
         await cb.message.reply(
             "🎵 Не смог достать звук из этого видео, увы",
-            disable_notification=True,
+            disable_notification=_silent_now(),
         )
     except Exception:  # noqa: BLE001
         pass
