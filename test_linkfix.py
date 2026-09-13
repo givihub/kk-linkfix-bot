@@ -90,6 +90,14 @@ def test_instagram_stories_recognized():
     assert r.original == "https://www.instagram.com/stories/zamaznoy/3976550502804472623"
 
 
+def test_instagram_carousel_item():
+    r = convert("https://www.instagram.com/p/DceBZkGCNjq/?img_index=10&stkn=MXR5OG5w")
+    assert r.item == 10
+    assert r.original == "https://www.instagram.com/p/DceBZkGCNjq/?img_index=10"
+    assert r.embed == "https://kkinstagram.com/p/DceBZkGCNjq/"
+    assert convert("https://www.instagram.com/p/DdBEI7bJEFW/?stkn=x").item is None
+
+
 def test_bare_url_without_scheme():
     r = convert("instagram.com/reel/XYZ/")
     assert r is not None and r.embed == "https://kkinstagram.com/reel/XYZ/"

@@ -41,7 +41,8 @@ _INSTA_PREFIXES = ("/reel/", "/reels/", "/p/", "/tv/", "/stories/")
 class FixedLink:
     original: str  # каноничная «красивая» ссылка (www-вид) — идёт в текст/кнопку
     embed: str     # фикс-ссылка основного домена (используется в fallback-превью)
-    platform: str  # instagram | tiktok | x
+    platform: str  # instagram | tiktok | x | youtube
+    item: int | None = None  # номер слайда карусели Instagram (img_index), если указан
 
     @property
     def label(self) -> str:
@@ -75,10 +76,17 @@ def convert(url: str) -> FixedLink | None:
     if host in ("instagram.com", "ddinstagram.com", *FIX_DOMAINS["instagram"]):
         if not path.startswith(_INSTA_PREFIXES):
             return None
+        # Карусель: img_index=N указывает на конкретный слайд
+        idx = parse_qs(parts.query).get("img_index", [""])[0]
+        item = int(idx) if idx.isdigit() and int(idx) > 0 else None
+        original = f"https://www.instagram.com{path}"
+        if item:
+            original += f"?img_index={item}"
         return FixedLink(
-            original=f"https://www.instagram.com{path}",
+            original=original,
             embed=f"https://{FIX_DOMAINS['instagram'][0]}{path}",
             platform="instagram",
+            item=item,
         )
 
     # --- TikTok: короткие ссылки vm./vt. -----------------------------------

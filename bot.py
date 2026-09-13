@@ -247,25 +247,33 @@ _RESTRICTED_MARKERS = (
 )
 
 
-async def _ytdlp_fetch(url: str) -> tuple[tuple[str, bytes] | None, bool]:
+async def _ytdlp_fetch(url: str, item: int | None = None) -> tuple[tuple[str, bytes] | None, bool]:
     """Последний рубеж: yt-dlp напрямую с платформы (без авторизации).
 
+    item — номер слайда карусели (Instagram img_index). Без него из карусели
+    берётся первое видео (фото-слайды пропускаются).
     Возвращает (media, restricted): media = ("video", bytes) при успехе;
     restricted=True, если контент закрыт владельцем / требует логина.
     """
     try:
         with tempfile.TemporaryDirectory(dir="/tmp") as td:
-            out = os.path.join(td, "v.mp4")
+            # playlist_index: для каруселей — номер слайда, для одиночных — 0
+            out = os.path.join(td, "v%(playlist_index|0)s.mp4")
             cmd = [
-                "yt-dlp", "-q", "--no-warnings", "--no-playlist",
+                "yt-dlp", "-q", "--no-warnings",
                 "--max-filesize", f"{max(_MAX_VIDEO // 1048576, 200)}M",
-                # качество из _YTDLP_SORT (по умолчанию до 1080p, кодек h264);
+                # качество из _YTDLP_SORT (по умолчанию до 720p, кодек h264);
                 # видео+звук склеиваются ffmpeg'ом при раздельных дорожках (DASH)
                 "-S", _YTDLP_SORT,
                 "--merge-output-format", "mp4",
-                "-o", out,
-                url,
             ]
+            if item:
+                cmd += ["--playlist-items", str(item)]
+            else:
+                # карусель без номера: фото-слайды дают ошибку — игнорируем,
+                # останавливаемся на первом успешно скачанном видео
+                cmd += ["--ignore-errors", "--max-downloads", "1"]
+            cmd += ["-o", out, url]
             if PROXY_URL:
                 cmd += ["--proxy", PROXY_URL]
             proc = await asyncio.create_subprocess_exec(
@@ -279,10 +287,14 @@ async def _ytdlp_fetch(url: str) -> tuple[tuple[str, bytes] | None, bool]:
                 proc.kill()
                 log.warning("yt-dlp: таймаут")
                 return None, False
-            if os.path.exists(out) and os.path.getsize(out) > 10_000:
-                with open(out, "rb") as f:
+            files = sorted(
+                f for f in os.listdir(td)
+                if f.endswith(".mp4") and os.path.getsize(os.path.join(td, f)) > 10_000
+            )
+            if files:
+                with open(os.path.join(td, files[0]), "rb") as f:
                     data = f.read()
-                log.info("yt-dlp: видео добыто напрямую (%d КБ)", len(data) // 1024)
+                log.info("yt-dlp: видео добыто напрямую (%d КБ, %s)", len(data) // 1024, files[0])
                 return ("video", data), False
             err_text = (err or b"").decode("utf-8", "ignore").lower()
             restricted = any(m in err_text for m in _RESTRICTED_MARKERS)
@@ -587,7 +599,7 @@ async def on_message(message: Message, bot: Bot) -> None:
             # Последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров.
             # Запускаем и когда фиксеры нашли только картинку: возможно,
             # это видео-пост, у которого фиксеры видят лишь обложку.
-            yt_media, restricted = await _ytdlp_fetch(fixed.original)
+            yt_media, restricted = await _ytdlp_fetch(fixed.original, fixed.item)
             if yt_media is not None:
                 media = yt_media  # видео побеждает фото
         meta = await meta_task
