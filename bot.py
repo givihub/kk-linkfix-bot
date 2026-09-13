@@ -18,7 +18,9 @@ import logging
 import os
 import re
 import secrets
+import socket
 import tempfile
+import time
 from collections import OrderedDict
 from datetime import datetime
 from html import escape, unescape
@@ -26,6 +28,8 @@ from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import aiohttp
+from aiohttp.abc import AbstractResolver
+from aiohttp.resolver import DefaultResolver
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -104,6 +108,58 @@ _OG_PATTERNS = (
 )
 
 _http: aiohttp.ClientSession | None = None
+
+
+class DoHFallbackResolver(AbstractResolver):
+    """Системный DNS, а при отказе — DNS-over-HTTPS (Cloudflare).
+
+    Нужен дома: провайдерский резолвер не отдаёт имена некоторых фиксеров
+    (kkinstagram.com), хотя сами серверы доступны. Внешние DNS роутер режет,
+    а DoH проходит как обычный HTTPS.
+    """
+
+    def __init__(self) -> None:
+        self._sys = DefaultResolver()
+        self._cache: dict[str, tuple[float, list[str]]] = {}
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_INET):
+        try:
+            return await self._sys.resolve(host, port, family)
+        except OSError:
+            pass
+        ips = await self._doh(host)
+        if not ips:
+            raise OSError(f"DoH: не удалось разрешить {host}")
+        return [
+            {"hostname": host, "host": ip, "port": port,
+             "family": socket.AF_INET, "proto": 0, "flags": socket.AI_NUMERICHOST}
+            for ip in ips
+        ]
+
+    async def _doh(self, host: str) -> list[str]:
+        now = time.time()
+        cached = self._cache.get(host)
+        if cached and cached[0] > now:
+            return cached[1]
+        ips: list[str] = []
+        try:
+            async with aiohttp.ClientSession() as s:  # cloudflare-dns.com резолвится штатно
+                async with s.get(
+                    "https://cloudflare-dns.com/dns-query",
+                    params={"name": host, "type": "A"},
+                    headers={"accept": "application/dns-json"},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as r:
+                    j = await r.json(content_type=None)
+            ips = [a["data"] for a in j.get("Answer", []) if a.get("type") == 1]
+            log.info("DoH: %s → %s", host, ips)
+        except Exception as e:  # noqa: BLE001
+            log.warning("DoH: %s не разрешён: %s", host, e)
+        self._cache[host] = (now + 300, ips)
+        return ips
+
+    async def close(self) -> None:
+        await self._sys.close()
 
 
 def _caption_url(fixed: FixedLink) -> str | None:
@@ -753,7 +809,9 @@ async def main() -> None:
     dp.include_router(router)
 
     global _http
-    _http = aiohttp.ClientSession()
+    _http = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(resolver=DoHFallbackResolver())
+    )
     try:
         me = await bot.get_me()
         log.info("Запущен как @%s (id=%s)", me.username, me.id)
