@@ -322,6 +322,8 @@ async def _ytdlp_fetch(url: str, item: int | None = None) -> tuple[tuple[str, by
                 # видео+звук склеиваются ffmpeg'ом при раздельных дорожках (DASH)
                 "-S", _YTDLP_SORT,
                 "--merge-output-format", "mp4",
+                # детектор зависания: 30 с без данных от CDN — обрыв и ретрай
+                "--socket-timeout", "30", "--retries", "3",
             ]
             if item:
                 cmd += ["--playlist-items", str(item)]
@@ -338,10 +340,12 @@ async def _ytdlp_fetch(url: str, item: int | None = None) -> tuple[tuple[str, by
                 stderr=asyncio.subprocess.PIPE,
             )
             try:
-                _, err = await asyncio.wait_for(proc.communicate(), timeout=120)
+                # Длинные ролики (YouTube в личке) качаются минутами —
+                # даём до 10 минут; зависание на CDN отсечёт --socket-timeout
+                _, err = await asyncio.wait_for(proc.communicate(), timeout=600)
             except asyncio.TimeoutError:
                 proc.kill()
-                log.warning("yt-dlp: таймаут")
+                log.warning("yt-dlp: таймаут (10 мин)")
                 return None, False
             files = sorted(
                 f for f in os.listdir(td)
@@ -370,9 +374,12 @@ async def _download_video(url: str) -> bytes | None:
             url,
             proxy=PROXY_URL,
             headers=_BROWSER_UA,
-            timeout=aiohttp.ClientTimeout(total=120),
+            # Детектор зависания: 30 с без единого байта — обрыв (а не 2 минуты
+            # ожидания); общий потолок 10 минут — для больших файлов
+            timeout=aiohttp.ClientTimeout(total=600, sock_connect=15, sock_read=30),
         ) as resp:
             if resp.status != 200:
+                log.info("CDN ответил %s на %s", resp.status, url[:80])
                 return None
             clen = int(resp.headers.get("Content-Length") or 0)
             if clen > _MAX_VIDEO:
@@ -388,6 +395,7 @@ async def _download_video(url: str) -> bytes | None:
             if len(buf) < 5_000:
                 log.warning("Скачанное подозрительно мало (%d байт) — отбрасываю", len(buf))
                 return None
+            log.info("Скачано %d КБ с %s", len(buf) // 1024, urlsplit(url).netloc)
             return bytes(buf)
     except Exception as e:  # noqa: BLE001
         log.warning("Не удалось скачать видео: %s", e)
@@ -441,6 +449,7 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
                     cap = int(_MAX_VIDEO * 8 * 0.9 / dur / 1000) - 128
                     kbps = max(300, min(6000, cap))
                 log.info("Кодек %s — перекодирую в h264 (%d kbps, %.0f c)", codec, kbps, dur)
+                t0 = time.monotonic()
                 rc, _ = await _run(
                     ["ffmpeg", "-y", "-i", src,
                      "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
@@ -448,6 +457,7 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
                      "-c:a", "aac", "-b:a", "128k",
                      "-movflags", "+faststart", dst]
                 )
+                log.info("Перекодирование заняло %.0f с (rc=%d)", time.monotonic() - t0, rc)
             else:
                 rc, _ = await _run(
                     ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", dst]
@@ -505,6 +515,34 @@ def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str | None) -> s
         lines.append(f"👤 от {sender}")
     # Пустая строка допустима: у видео/фото подпись опциональна
     return "\n".join(lines)
+
+
+# Очередь: ролики обрабатываются строго по одному. Параллельная обработка
+# на 4 ядрах даёт толкотню за CPU (ffmpeg) и сеть, а одна и та же ссылка
+# в двух чатах — двойное скачивание.
+_WORK_LOCK = asyncio.Lock()
+
+# Кэш доставленных медиа: канонический URL → (тип, file_id, срок годности).
+# Та же ссылка во втором чате уходит мгновенно по file_id без скачивания.
+_RECENT: OrderedDict[str, tuple[str, str, float]] = OrderedDict()
+_RECENT_TTL = 3600.0
+
+
+def _recent_get(fixed: FixedLink) -> tuple[str, str] | None:
+    rec = _RECENT.get(fixed.original)
+    if rec is None:
+        return None
+    kind, file_id, exp = rec
+    if exp < time.monotonic():
+        _RECENT.pop(fixed.original, None)
+        return None
+    return kind, file_id
+
+
+def _recent_put(fixed: FixedLink, kind: str, file_id: str) -> None:
+    _RECENT[fixed.original] = (kind, file_id, time.monotonic() + _RECENT_TTL)
+    while len(_RECENT) > 200:
+        _RECENT.popitem(last=False)
 
 
 # Кэш «кнопка → ссылка» для извлечения звука (callback_data ограничена 64 байтами)
@@ -636,108 +674,142 @@ async def on_message(message: Message, bot: Bot) -> None:
     )
     sent_all = True
     all_video = True  # оригинал удаляем только если видео реально доставлено
-    for fixed in links:
-        # Индикатор «отправляет видео…» в шапке чата
-        try:
-            await bot.send_chat_action(message.chat.id, "upload_video")
-        except Exception:  # noqa: BLE001
-            pass
-
-        # Текст поста и поиск медиа — параллельно (экономит до ~4 с)
-        meta_task = asyncio.create_task(_fetch_meta(fixed))
-        media = await _fetch_media(fixed)
-        if media is None:
-            # у фиксеров бывают транзиентные 5xx — второй проход цепочки
-            await asyncio.sleep(4)
-            media = await _fetch_media(fixed)
-        restricted = False
-        if media is None or media[0] == "photo":
-            # Последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров.
-            # Запускаем и когда фиксеры нашли только картинку: возможно,
-            # это видео-пост, у которого фиксеры видят лишь обложку.
-            yt_media, restricted = await _ytdlp_fetch(fixed.original, fixed.item)
-            if yt_media is not None:
-                media = yt_media  # видео побеждает фото
-        meta = await meta_task
-        text = _build_text(fixed, meta, sender)
-        sent = False
-
-        # Основной путь: скачанное медиа загружаем в Telegram файлом —
-        # не зависит ни от кэша превью, ни от блокировок CDN.
-        if media:
-            kind, data = media
+    # Очередь: ролики обрабатываем по одному — без толкотни за CPU/сеть
+    async with _WORK_LOCK:
+        for fixed in links:
+            # Индикатор «отправляет видео…» в шапке чата
             try:
-                if kind == "video":
-                    data, vmeta, thumb = await _prepare_video(data)
-                    await message.answer_video(
-                        video=BufferedInputFile(data, filename="video.mp4"),
-                        caption=text or None,
-                        reply_markup=_keyboard(fixed, with_audio=True),
-                        disable_notification=_silent_now(),
-                        supports_streaming=True,
-                        width=vmeta.get("width"),
-                        height=vmeta.get("height"),
-                        duration=vmeta.get("duration"),
-                        thumbnail=BufferedInputFile(thumb, "thumb.jpg") if thumb else None,
-                        request_timeout=300,
+                await bot.send_chat_action(message.chat.id, "upload_video")
+            except Exception:  # noqa: BLE001
+                pass
+
+            # Кэш: ту же ссылку недавно уже доставляли — шлём по file_id,
+            # без повторного скачивания и перекодирования
+            cached = _recent_get(fixed)
+            if cached:
+                ckind, file_id = cached
+                try:
+                    meta = await _fetch_meta(fixed)
+                    text = _build_text(fixed, meta, sender)
+                    if ckind == "video":
+                        await message.answer_video(
+                            video=file_id,
+                            caption=text or None,
+                            reply_markup=_keyboard(fixed, with_audio=True),
+                            disable_notification=_silent_now(),
+                        )
+                    else:
+                        await message.answer_photo(
+                            photo=file_id,
+                            caption=text or None,
+                            reply_markup=_keyboard(fixed),
+                            disable_notification=_silent_now(),
+                        )
+                    log.info("chat=%s: %s отправлено из кэша (file_id)", message.chat.id, fixed.original)
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Отправка из кэша не удалась (%s) — качаю заново", e)
+                    _RECENT.pop(fixed.original, None)
+
+            # Текст поста и поиск медиа — параллельно (экономит до ~4 с)
+            meta_task = asyncio.create_task(_fetch_meta(fixed))
+            media = await _fetch_media(fixed)
+            if media is None:
+                # у фиксеров бывают транзиентные 5xx — второй проход цепочки
+                await asyncio.sleep(4)
+                media = await _fetch_media(fixed)
+            restricted = False
+            if media is None or media[0] == "photo":
+                # Последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров.
+                # Запускаем и когда фиксеры нашли только картинку: возможно,
+                # это видео-пост, у которого фиксеры видят лишь обложку.
+                yt_media, restricted = await _ytdlp_fetch(fixed.original, fixed.item)
+                if yt_media is not None:
+                    media = yt_media  # видео побеждает фото
+            meta = await meta_task
+            text = _build_text(fixed, meta, sender)
+            sent = False
+
+            # Основной путь: скачанное медиа загружаем в Telegram файлом —
+            # не зависит ни от кэша превью, ни от блокировок CDN.
+            if media:
+                kind, data = media
+                try:
+                    if kind == "video":
+                        data, vmeta, thumb = await _prepare_video(data)
+                        sent_msg = await message.answer_video(
+                            video=BufferedInputFile(data, filename="video.mp4"),
+                            caption=text or None,
+                            reply_markup=_keyboard(fixed, with_audio=True),
+                            disable_notification=_silent_now(),
+                            supports_streaming=True,
+                            width=vmeta.get("width"),
+                            height=vmeta.get("height"),
+                            duration=vmeta.get("duration"),
+                            thumbnail=BufferedInputFile(thumb, "thumb.jpg") if thumb else None,
+                            request_timeout=300,
+                        )
+                        if sent_msg.video:
+                            _recent_put(fixed, "video", sent_msg.video.file_id)
+                    else:  # photo — фото-пост без видео
+                        sent_msg = await message.answer_photo(
+                            photo=BufferedInputFile(data, filename="photo.jpg"),
+                            caption=text or None,
+                            reply_markup=_keyboard(fixed),
+                            disable_notification=_silent_now(),
+                            request_timeout=120,
+                        )
+                        if sent_msg.photo:
+                            _recent_put(fixed, "photo", sent_msg.photo[-1].file_id)
+                    sent = True
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "Загрузка медиа в Telegram не прошла (%s, %s): %s — откат на превью",
+                        fixed.platform,
+                        kind,
+                        e,
                     )
-                else:  # photo — фото-пост без видео
-                    await message.answer_photo(
-                        photo=BufferedInputFile(data, filename="photo.jpg"),
-                        caption=text or None,
+
+            # Контент закрыт владельцем: честно сообщаем (с автором ссылки),
+            # оригинал при этом удаляется как и при обычной замене
+            if not sent and restricted:
+                try:
+                    locked = (
+                        "🔒 Владелец закрыл это видео — платформа показывает его "
+                        "только авторизованным пользователям, бот бессилен. "
+                        "Открыть можно по кнопке."
+                    )
+                    if sender:
+                        locked += f"\n👤 от {sender}"
+                    await message.answer(
+                        locked,
+                        reply_markup=_keyboard(fixed),
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
+                        disable_notification=_silent_now(),
+                    )
+                    sent = True
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось отправить сообщение об ограничении")
+
+            # Fallback: видео добыть не вышло (CDN/фиксеры не ответили) —
+            # говорим об этом честно, оригинал оставляем в чате
+            if not sent:
+                all_video = False
+                try:
+                    fail = (
+                        "⚠️ Видео добыть не удалось — источник не отвечает. "
+                        "Попробуйте прислать ссылку позже."
+                    )
+                    await message.answer(
+                        f"{fail}\n{text}" if text else fail,
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                         reply_markup=_keyboard(fixed),
                         disable_notification=_silent_now(),
-                        request_timeout=120,
                     )
-                sent = True
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "Загрузка медиа в Telegram не прошла (%s, %s): %s — откат на превью",
-                    fixed.platform,
-                    kind,
-                    e,
-                )
-
-        # Контент закрыт владельцем: честно сообщаем (с автором ссылки),
-        # оригинал при этом удаляется как и при обычной замене
-        if not sent and restricted:
-            try:
-                locked = (
-                    "🔒 Владелец закрыл это видео — платформа показывает его "
-                    "только авторизованным пользователям, бот бессилен. "
-                    "Открыть можно по кнопке."
-                )
-                if sender:
-                    locked += f"\n👤 от {sender}"
-                await message.answer(
-                    locked,
-                    reply_markup=_keyboard(fixed),
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                    disable_notification=_silent_now(),
-                )
-                sent = True
-            except Exception:  # noqa: BLE001
-                log.exception("Не удалось отправить сообщение об ограничении")
-
-        # Fallback: сообщение с веб-превью (без лимита 45 МБ)
-        if not sent:
-            all_video = False
-            try:
-                await message.answer(
-                    # текстовое сообщение пустым быть не может — минимум название
-                    text or f"<b>{fixed.label}</b>",
-                    link_preview_options=LinkPreviewOptions(
-                        url=fixed.embed,
-                        prefer_large_media=True,
-                        show_above_text=True,
-                    ),
-                    reply_markup=_keyboard(fixed),
-                    disable_notification=_silent_now(),
-                )
-                sent = True
-            except Exception:  # noqa: BLE001
-                sent_all = False
-                log.exception("Не удалось отправить сообщение с превью")
+                    sent = True
+                except Exception:  # noqa: BLE001
+                    sent_all = False
+                    log.exception("Не удалось отправить сообщение о неудаче")
 
     # Удаляем оригинал только если каждое видео реально доставлено файлом.
     # Если пришлось откатиться на превью — оригинал не трогаем (честнее).
@@ -764,7 +836,8 @@ async def on_audio_button(cb: CallbackQuery, bot: Bot) -> None:
     except Exception:  # noqa: BLE001
         pass
     log.info("chat=%s: извлекаю аудио из %s", cb.message.chat.id, url)
-    data = await _ytdlp_audio(url)
+    async with _WORK_LOCK:  # та же очередь, что и у видео
+        data = await _ytdlp_audio(url)
     if data:
         try:
             await cb.message.reply_audio(
