@@ -85,6 +85,9 @@ _MAX_VIDEO = int(os.getenv("MAX_VIDEO_MB", "45")) * 1024 * 1024
 BOT_API_URL = os.getenv("BOT_API_URL") or None
 # Предпочтения качества yt-dlp
 _YTDLP_SORT = os.getenv("YTDLP_SORT", "res:720,vcodec:h264")
+# YouTube в группах: ролики не длиннее N минут (0 = не обрабатывать в группах).
+# Длинные видео и стримы Telegram и так играет сам — бот их не трогает.
+_YT_GROUP_MAX_MIN = int(os.getenv("YT_GROUP_MAX_MIN", "30"))
 
 # Режим тишины: с QUIET_FROM до QUIET_TO часов (по QUIET_TZ) сообщения без звука
 _QUIET_TZ = ZoneInfo(os.getenv("QUIET_TZ", "Europe/Moscow"))
@@ -305,8 +308,8 @@ _RESTRICTED_MARKERS = (
 
 
 async def _ytdlp_fetch(
-    url: str, item: int | None = None, platform: str = ""
-) -> tuple[tuple[str, bytes] | None, bool]:
+    url: str, item: int | None = None, platform: str = "", max_minutes: int = 0
+) -> tuple[tuple[str, bytes] | None, str]:
     """Последний рубеж: yt-dlp напрямую с платформы (без авторизации).
 
     item — номер слайда карусели (Instagram img_index). Без него из карусели
@@ -314,8 +317,10 @@ async def _ytdlp_fetch(
     platform — для YouTube берём HLS-поток и качаем фрагменты параллельно:
     прогрессивные DASH-ссылки YouTube троттлит непредсказуемо (один и тот же
     ролик 72 МБ — от 15 с до 4 мин, бывают 403), HLS даёт стабильную минуту.
-    Возвращает (media, restricted): media = ("video", bytes) при успехе;
-    restricted=True, если контент закрыт владельцем / требует логина.
+    max_minutes > 0 — ролики длиннее (и прямые эфиры) пропускаем без скачивания.
+    Возвращает (media, status): media = ("video", bytes) при успехе; status —
+    "ok" | "restricted" (закрыто владельцем / нужен логин) | "skipped"
+    (не прошёл фильтр длительности) | "fail".
     """
     try:
         with tempfile.TemporaryDirectory(dir="/tmp") as td:
@@ -333,6 +338,9 @@ async def _ytdlp_fetch(
             ]
             if platform == "youtube":
                 cmd += ["--concurrent-fragments", "8"]
+            if max_minutes > 0:
+                # yt-dlp тихо пропускает ролик: rc=0, файла нет, stderr пуст
+                cmd += ["--match-filters", f"duration<={max_minutes * 60} & !is_live"]
             if item:
                 cmd += ["--playlist-items", str(item)]
             else:
@@ -354,7 +362,7 @@ async def _ytdlp_fetch(
             except asyncio.TimeoutError:
                 proc.kill()
                 log.warning("yt-dlp: таймаут (10 мин)")
-                return None, False
+                return None, "fail"
             files = sorted(
                 f for f in os.listdir(td)
                 if f.endswith(".mp4") and os.path.getsize(os.path.join(td, f)) > 10_000
@@ -363,14 +371,17 @@ async def _ytdlp_fetch(
                 with open(os.path.join(td, files[0]), "rb") as f:
                     data = f.read()
                 log.info("yt-dlp: видео добыто напрямую (%d КБ, %s)", len(data) // 1024, files[0])
-                return ("video", data), False
+                return ("video", data), "ok"
             err_text = (err or b"").decode("utf-8", "ignore").lower()
+            if max_minutes > 0 and proc.returncode == 0 and not err_text.strip():
+                log.info("yt-dlp: ролик длиннее %d мин или стрим — пропускаю", max_minutes)
+                return None, "skipped"
             restricted = any(m in err_text for m in _RESTRICTED_MARKERS)
             log.info("yt-dlp: не вышло (restricted=%s): %s", restricted, err_text[-250:])
-            return None, restricted
+            return None, "restricted" if restricted else "fail"
     except Exception as e:  # noqa: BLE001
         log.warning("yt-dlp: ошибка запуска: %s", e)
-        return None, False
+        return None, "fail"
 
 
 async def _download_video(url: str) -> bytes | None:
@@ -678,8 +689,11 @@ async def on_message(message: Message, bot: Bot) -> None:
     links = _extract_links(message)
     is_private = message.chat.type == ChatType.PRIVATE
 
-    # YouTube — только в личке: в группах Telegram сам играет его нативно
-    links = [f for f in links if f.platform != "youtube" or is_private]
+    # YouTube в группах — только короткие ролики (YT_GROUP_MAX_MIN; 0 = выкл.):
+    # длинные видео и стримы Telegram играет сам, бот их не трогает
+    if not is_private and _YT_GROUP_MAX_MIN <= 0:
+        links = [f for f in links if f.platform != "youtube"]
+    yt_max_min = 0 if is_private else _YT_GROUP_MAX_MIN
 
     # Плейлисты YouTube — только в личке, первые 10 роликов
     if is_private:
@@ -748,16 +762,26 @@ async def on_message(message: Message, bot: Bot) -> None:
                 # у фиксеров бывают транзиентные 5xx — второй проход цепочки
                 await asyncio.sleep(4)
                 media = await _fetch_media(fixed)
-            restricted = False
+            status = "fail"
             if media is None or media[0] == "photo":
                 # Последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров.
                 # Запускаем и когда фиксеры нашли только картинку: возможно,
                 # это видео-пост, у которого фиксеры видят лишь обложку.
-                yt_media, restricted = await _ytdlp_fetch(
-                    fixed.original, fixed.item, fixed.platform
+                yt_media, status = await _ytdlp_fetch(
+                    fixed.original,
+                    fixed.item,
+                    fixed.platform,
+                    yt_max_min if fixed.platform == "youtube" else 0,
                 )
                 if yt_media is not None:
                     media = yt_media  # видео побеждает фото
+            if media is None and status == "skipped":
+                # Длинный ролик/стрим YouTube в группе: оставляем как есть —
+                # Telegram покажет своё превью, нам добавить нечего
+                meta_task.cancel()
+                all_video = False
+                continue
+            restricted = status == "restricted"
             meta = await meta_task
             text = _build_text(fixed, meta, sender)
             sent = False
@@ -827,6 +851,11 @@ async def on_message(message: Message, bot: Bot) -> None:
             # говорим об этом честно, оригинал оставляем в чате
             if not sent:
                 all_video = False
+                if fixed.platform == "youtube" and not is_private:
+                    # в группе у YouTube и так есть родное превью Telegram —
+                    # не шумим, просто оставляем ссылку как есть
+                    log.info("chat=%s: YouTube не добыт, оставляю ссылку как есть", message.chat.id)
+                    continue
                 try:
                     fail = (
                         "⚠️ Видео добыть не удалось — источник не отвечает. "
