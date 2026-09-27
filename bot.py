@@ -22,6 +22,7 @@ import socket
 import tempfile
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import datetime
 from html import escape, unescape
 from urllib.parse import urlsplit, urlunsplit
@@ -303,11 +304,16 @@ _RESTRICTED_MARKERS = (
 )
 
 
-async def _ytdlp_fetch(url: str, item: int | None = None) -> tuple[tuple[str, bytes] | None, bool]:
+async def _ytdlp_fetch(
+    url: str, item: int | None = None, platform: str = ""
+) -> tuple[tuple[str, bytes] | None, bool]:
     """Последний рубеж: yt-dlp напрямую с платформы (без авторизации).
 
     item — номер слайда карусели (Instagram img_index). Без него из карусели
     берётся первое видео (фото-слайды пропускаются).
+    platform — для YouTube берём HLS-поток и качаем фрагменты параллельно:
+    прогрессивные DASH-ссылки YouTube троттлит непредсказуемо (один и тот же
+    ролик 72 МБ — от 15 с до 4 мин, бывают 403), HLS даёт стабильную минуту.
     Возвращает (media, restricted): media = ("video", bytes) при успехе;
     restricted=True, если контент закрыт владельцем / требует логина.
     """
@@ -320,11 +326,13 @@ async def _ytdlp_fetch(url: str, item: int | None = None) -> tuple[tuple[str, by
                 "--max-filesize", f"{max(_MAX_VIDEO // 1048576, 200)}M",
                 # качество из _YTDLP_SORT (по умолчанию до 720p, кодек h264);
                 # видео+звук склеиваются ffmpeg'ом при раздельных дорожках (DASH)
-                "-S", _YTDLP_SORT,
+                "-S", _YTDLP_SORT + (",proto:m3u8" if platform == "youtube" else ""),
                 "--merge-output-format", "mp4",
                 # детектор зависания: 30 с без данных от CDN — обрыв и ретрай
-                "--socket-timeout", "30", "--retries", "3",
+                "--socket-timeout", "30", "--retries", "3", "--fragment-retries", "5",
             ]
+            if platform == "youtube":
+                cmd += ["--concurrent-fragments", "8"]
             if item:
                 cmd += ["--playlist-items", str(item)]
             else:
@@ -517,6 +525,33 @@ def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str | None) -> s
     return "\n".join(lines)
 
 
+@asynccontextmanager
+async def _chat_action(bot: Bot, chat_id: int, action: str):
+    """Держит индикатор «отправляет видео…» в шапке чата, пока идёт работа.
+
+    Telegram показывает chat action ~5 с, а добыча ролика с YouTube может
+    занять минуты — без повтора пользователь думает, что бот умер.
+    """
+
+    async def _loop() -> None:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id, action)
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(4.5)
+
+    task = asyncio.create_task(_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+
+
 # Очередь: ролики обрабатываются строго по одному. Параллельная обработка
 # на 4 ядрах даёт толкотню за CPU (ffmpeg) и сеть, а одна и та же ссылка
 # в двух чатах — двойное скачивание.
@@ -674,15 +709,10 @@ async def on_message(message: Message, bot: Bot) -> None:
     )
     sent_all = True
     all_video = True  # оригинал удаляем только если видео реально доставлено
-    # Очередь: ролики обрабатываем по одному — без толкотни за CPU/сеть
-    async with _WORK_LOCK:
+    # Очередь: ролики обрабатываем по одному — без толкотни за CPU/сеть.
+    # Пока ждём и работаем — в шапке чата крутится «отправляет видео…»
+    async with _chat_action(bot, message.chat.id, "upload_video"), _WORK_LOCK:
         for fixed in links:
-            # Индикатор «отправляет видео…» в шапке чата
-            try:
-                await bot.send_chat_action(message.chat.id, "upload_video")
-            except Exception:  # noqa: BLE001
-                pass
-
             # Кэш: ту же ссылку недавно уже доставляли — шлём по file_id,
             # без повторного скачивания и перекодирования
             cached = _recent_get(fixed)
@@ -713,8 +743,8 @@ async def on_message(message: Message, bot: Bot) -> None:
 
             # Текст поста и поиск медиа — параллельно (экономит до ~4 с)
             meta_task = asyncio.create_task(_fetch_meta(fixed))
-            media = await _fetch_media(fixed)
-            if media is None:
+            media = await _fetch_media(fixed) if fixed.candidates else None
+            if media is None and fixed.candidates:
                 # у фиксеров бывают транзиентные 5xx — второй проход цепочки
                 await asyncio.sleep(4)
                 media = await _fetch_media(fixed)
@@ -723,7 +753,9 @@ async def on_message(message: Message, bot: Bot) -> None:
                 # Последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров.
                 # Запускаем и когда фиксеры нашли только картинку: возможно,
                 # это видео-пост, у которого фиксеры видят лишь обложку.
-                yt_media, restricted = await _ytdlp_fetch(fixed.original, fixed.item)
+                yt_media, restricted = await _ytdlp_fetch(
+                    fixed.original, fixed.item, fixed.platform
+                )
                 if yt_media is not None:
                     media = yt_media  # видео побеждает фото
             meta = await meta_task
@@ -831,12 +863,9 @@ async def on_audio_button(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Кнопка устарела — киньте ссылку ещё раз", show_alert=True)
         return
     await cb.answer("Достаю звук…")
-    try:
-        await bot.send_chat_action(cb.message.chat.id, "upload_document")
-    except Exception:  # noqa: BLE001
-        pass
     log.info("chat=%s: извлекаю аудио из %s", cb.message.chat.id, url)
-    async with _WORK_LOCK:  # та же очередь, что и у видео
+    # та же очередь, что и у видео; индикатор «отправляет файл…» на всё время
+    async with _chat_action(bot, cb.message.chat.id, "upload_document"), _WORK_LOCK:
         data = await _ytdlp_audio(url)
     if data:
         try:
