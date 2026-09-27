@@ -85,9 +85,20 @@ _MAX_VIDEO = int(os.getenv("MAX_VIDEO_MB", "45")) * 1024 * 1024
 BOT_API_URL = os.getenv("BOT_API_URL") or None
 # Предпочтения качества yt-dlp
 _YTDLP_SORT = os.getenv("YTDLP_SORT", "res:720,vcodec:h264")
+# Отдельный прокси только для YouTube (yt-dlp): домашний VPN-каскад отдаёт
+# googlevideo по 0.2–1 МБ/с, через GW-09 — 5+ МБ/с. Пусто = общий PROXY_URL.
+_YT_PROXY = os.getenv("YOUTUBE_PROXY_URL") or PROXY_URL
 # YouTube в группах: ролики не длиннее N минут (0 = не обрабатывать в группах).
 # Длинные видео и стримы Telegram и так играет сам — бот их не трогает.
 _YT_GROUP_MAX_MIN = int(os.getenv("YT_GROUP_MAX_MIN", "30"))
+
+
+def _proxy_for(url: str) -> str | None:
+    """Прокси для yt-dlp по адресу: YouTube — свой, остальное — общий."""
+    host = urlsplit(url).netloc.lower()
+    if host.endswith(("youtube.com", "youtu.be")):
+        return _YT_PROXY
+    return PROXY_URL
 
 # Режим тишины: с QUIET_FROM до QUIET_TO часов (по QUIET_TZ) сообщения без звука
 _QUIET_TZ = ZoneInfo(os.getenv("QUIET_TZ", "Europe/Moscow"))
@@ -322,6 +333,10 @@ async def _ytdlp_fetch(
     "ok" | "restricted" (закрыто владельцем / нужен логин) | "skipped"
     (не прошёл фильтр длительности) | "fail".
     """
+    proxy = _YT_PROXY if platform == "youtube" else PROXY_URL
+    # HLS + параллельные фрагменты — костыль против троттлинга DASH через
+    # домашний каскад; с отдельным YouTube-прокси DASH качается за секунды
+    yt_hls = platform == "youtube" and not os.getenv("YOUTUBE_PROXY_URL")
     try:
         with tempfile.TemporaryDirectory(dir="/tmp") as td:
             # playlist_index: для каруселей — номер слайда, для одиночных — 0
@@ -331,13 +346,13 @@ async def _ytdlp_fetch(
                 "--max-filesize", f"{max(_MAX_VIDEO // 1048576, 200)}M",
                 # качество из _YTDLP_SORT (по умолчанию до 720p, кодек h264);
                 # видео+звук склеиваются ffmpeg'ом при раздельных дорожках (DASH)
-                "-S", _YTDLP_SORT + (",proto:m3u8" if platform == "youtube" else ""),
+                "-S", _YTDLP_SORT + (",proto:m3u8" if yt_hls else ""),
                 "--merge-output-format", "mp4",
                 # детектор зависания: 30 с без данных от CDN — обрыв и ретрай
-                "--socket-timeout", "30", "--retries", "3", "--fragment-retries", "5",
+                "--socket-timeout", "30", "--retries", "3", "--fragment-retries", "10",
             ]
-            if platform == "youtube":
-                cmd += ["--concurrent-fragments", "8"]
+            if yt_hls:
+                cmd += ["--concurrent-fragments", "16"]
             if max_minutes > 0:
                 # yt-dlp тихо пропускает ролик: rc=0, файла нет, stderr пуст
                 cmd += ["--match-filters", f"duration<={max_minutes * 60} & !is_live"]
@@ -348,8 +363,8 @@ async def _ytdlp_fetch(
                 # останавливаемся на первом успешно скачанном видео
                 cmd += ["--ignore-errors", "--max-downloads", "1"]
             cmd += ["-o", out, url]
-            if PROXY_URL:
-                cmd += ["--proxy", PROXY_URL]
+            if proxy:
+                cmd += ["--proxy", proxy]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -366,6 +381,9 @@ async def _ytdlp_fetch(
             files = sorted(
                 f for f in os.listdir(td)
                 if f.endswith(".mp4") and os.path.getsize(os.path.join(td, f)) > 10_000
+                # v0.f232.mp4 — промежуточная дорожка (только видео, без звука):
+                # остаётся, если склейка не случилась. Это не результат.
+                and not re.search(r"\.f\d+(-\d+)?\.mp4$", f)
             )
             if files:
                 with open(os.path.join(td, files[0]), "rb") as f:
@@ -451,7 +469,15 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
                 ["ffprobe", "-v", "error", "-select_streams", "v:0",
                  "-show_entries", "stream=codec_name", "-of", "csv=p=0", src]
             )
-            codec = out.decode("utf-8", "ignore").strip().lower() if rc == 0 else ""
+            # У файлов из HLS ffprobe печатает кодек дважды (секция programs +
+            # streams) — берём первую непустую строку, иначе "h264\n\nh264" ≠ h264
+            # и 23-минутный ролик уходил в ненужное перекодирование
+            codec_lines = [
+                ln.strip().lower()
+                for ln in out.decode("utf-8", "ignore").splitlines()
+                if ln.strip()
+            ] if rc == 0 else []
+            codec = codec_lines[0] if codec_lines else ""
             # Перекодируем, если кодек несовместим ИЛИ файл не влезает в лимит
             if (codec and codec != "h264") or len(data) > _MAX_VIDEO:
                 # Потолок битрейта из длительности: файл должен влезть в 45 МБ
@@ -626,8 +652,8 @@ async def _ytdlp_audio(url: str) -> bytes | None:
                 "-x", "--audio-format", "mp3", "--audio-quality", "192K",
                 "-o", out, url,
             ]
-            if PROXY_URL:
-                cmd += ["--proxy", PROXY_URL]
+            if _proxy_for(url):
+                cmd += ["--proxy", _proxy_for(url)]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -651,8 +677,8 @@ async def _expand_playlist(url: str) -> list[str]:
     """Первые 10 роликов плейлиста YouTube (только для лички)."""
     cmd = ["yt-dlp", "-q", "--no-warnings", "--flat-playlist",
            "--playlist-end", "10", "--print", "url", url]
-    if PROXY_URL:
-        cmd += ["--proxy", PROXY_URL]
+    if _YT_PROXY:  # плейлисты — только YouTube
+        cmd += ["--proxy", _YT_PROXY]
     rc, out = await _run(cmd)
     urls = [l.strip() for l in out.decode("utf-8", "ignore").splitlines()
             if l.strip().startswith("http")]
