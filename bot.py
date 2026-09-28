@@ -630,7 +630,7 @@ def _remember_audio(url: str) -> str:
 
 
 def _keyboard(fixed: FixedLink, with_audio: bool = False) -> InlineKeyboardMarkup:
-    row = [InlineKeyboardButton(text=f"{fixed.label} ↗", url=fixed.original)]
+    row = [InlineKeyboardButton(text=fixed.label, url=fixed.original)]
     if with_audio:
         row.append(
             InlineKeyboardButton(
