@@ -318,9 +318,23 @@ _RESTRICTED_MARKERS = (
 )
 
 
+def _read_ytdlp_meta(path: str) -> dict[str, str]:
+    """meta.txt от --print-to-file: строка 1 — название, строка 2 — канал."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            lines = [ln.strip() for ln in f.read().splitlines()]
+    except OSError:
+        return {}
+    title = lines[0] if lines else ""
+    author = lines[1] if len(lines) > 1 else ""
+    if title in ("NA", ""):
+        return {}
+    return {"title": title, "author": "" if author == "NA" else author}
+
+
 async def _ytdlp_fetch(
     url: str, item: int | None = None, platform: str = "", max_minutes: int = 0
-) -> tuple[tuple[str, bytes] | None, str]:
+) -> tuple[tuple[str, bytes] | None, str, dict[str, str]]:
     """Последний рубеж: yt-dlp напрямую с платформы (без авторизации).
 
     item — номер слайда карусели (Instagram img_index). Без него из карусели
@@ -329,9 +343,10 @@ async def _ytdlp_fetch(
     прогрессивные DASH-ссылки YouTube троттлит непредсказуемо (один и тот же
     ролик 72 МБ — от 15 с до 4 мин, бывают 403), HLS даёт стабильную минуту.
     max_minutes > 0 — ролики длиннее (и прямые эфиры) пропускаем без скачивания.
-    Возвращает (media, status): media = ("video", bytes) при успехе; status —
-    "ok" | "restricted" (закрыто владельцем / нужен логин) | "skipped"
-    (не прошёл фильтр длительности) | "fail".
+    Возвращает (media, status, meta): media = ("video", bytes) при успехе;
+    status — "ok" | "restricted" (закрыто владельцем / нужен логин) |
+    "skipped" (не прошёл фильтр длительности) | "fail"; meta — название и
+    автор ролика по данным yt-dlp (для подписи, когда фиксеры их не дают).
     """
     proxy = _YT_PROXY if platform == "youtube" else PROXY_URL
     # HLS + параллельные фрагменты — костыль против троттлинга DASH через
@@ -362,6 +377,11 @@ async def _ytdlp_fetch(
                 # карусель без номера: фото-слайды дают ошибку — игнорируем,
                 # останавливаемся на первом успешно скачанном видео
                 cmd += ["--ignore-errors", "--max-downloads", "1"]
+            # Название и канал — в файл рядом с видео (для подписи);
+            # --no-simulate: иначе --print-to-file отключает скачивание
+            meta_path = os.path.join(td, "meta.txt")
+            cmd += ["--no-simulate", "--print-to-file",
+                    "%(title|)s\n%(channel,uploader|)s", meta_path]
             cmd += ["-o", out, url]
             if proxy:
                 cmd += ["--proxy", proxy]
@@ -377,7 +397,7 @@ async def _ytdlp_fetch(
             except asyncio.TimeoutError:
                 proc.kill()
                 log.warning("yt-dlp: таймаут (10 мин)")
-                return None, "fail"
+                return None, "fail", {}
             files = sorted(
                 f for f in os.listdir(td)
                 if f.endswith(".mp4") and os.path.getsize(os.path.join(td, f)) > 10_000
@@ -389,17 +409,17 @@ async def _ytdlp_fetch(
                 with open(os.path.join(td, files[0]), "rb") as f:
                     data = f.read()
                 log.info("yt-dlp: видео добыто напрямую (%d КБ, %s)", len(data) // 1024, files[0])
-                return ("video", data), "ok"
+                return ("video", data), "ok", _read_ytdlp_meta(meta_path)
             err_text = (err or b"").decode("utf-8", "ignore").lower()
             if max_minutes > 0 and proc.returncode == 0 and not err_text.strip():
                 log.info("yt-dlp: ролик длиннее %d мин или стрим — пропускаю", max_minutes)
-                return None, "skipped"
+                return None, "skipped", {}
             restricted = any(m in err_text for m in _RESTRICTED_MARKERS)
             log.info("yt-dlp: не вышло (restricted=%s): %s", restricted, err_text[-250:])
-            return None, "restricted" if restricted else "fail"
+            return None, "restricted" if restricted else "fail", {}
     except Exception as e:  # noqa: BLE001
         log.warning("yt-dlp: ошибка запуска: %s", e)
-        return None, "fail"
+        return None, "fail", {}
 
 
 async def _download_video(url: str) -> bytes | None:
@@ -551,6 +571,9 @@ def _build_text(fixed: FixedLink, meta: dict[str, str], sender: str | None) -> s
         if len(title) > 80:
             title = title[:79] + "…"
         lines.append(f"<b>{escape(title)}</b>")
+    author = meta.get("author", "").strip()
+    if author:  # канал YouTube — под названием, курсивом
+        lines.append(f"<i>{escape(author)}</i>")
     desc = meta.get("description", "").strip()
     if desc:
         if len(desc) > 750:  # лимит подписи к видео — 1024 видимых символа
@@ -596,23 +619,23 @@ _WORK_LOCK = asyncio.Lock()
 
 # Кэш доставленных медиа: канонический URL → (тип, file_id, срок годности).
 # Та же ссылка во втором чате уходит мгновенно по file_id без скачивания.
-_RECENT: OrderedDict[str, tuple[str, str, float]] = OrderedDict()
+_RECENT: OrderedDict[str, tuple[str, str, dict[str, str], float]] = OrderedDict()
 _RECENT_TTL = 3600.0
 
 
-def _recent_get(fixed: FixedLink) -> tuple[str, str] | None:
+def _recent_get(fixed: FixedLink) -> tuple[str, str, dict[str, str]] | None:
     rec = _RECENT.get(fixed.original)
     if rec is None:
         return None
-    kind, file_id, exp = rec
+    kind, file_id, meta, exp = rec
     if exp < time.monotonic():
         _RECENT.pop(fixed.original, None)
         return None
-    return kind, file_id
+    return kind, file_id, meta
 
 
-def _recent_put(fixed: FixedLink, kind: str, file_id: str) -> None:
-    _RECENT[fixed.original] = (kind, file_id, time.monotonic() + _RECENT_TTL)
+def _recent_put(fixed: FixedLink, kind: str, file_id: str, meta: dict[str, str]) -> None:
+    _RECENT[fixed.original] = (kind, file_id, meta, time.monotonic() + _RECENT_TTL)
     while len(_RECENT) > 200:
         _RECENT.popitem(last=False)
 
@@ -757,9 +780,9 @@ async def on_message(message: Message, bot: Bot) -> None:
             # без повторного скачивания и перекодирования
             cached = _recent_get(fixed)
             if cached:
-                ckind, file_id = cached
+                ckind, file_id, cmeta = cached
                 try:
-                    meta = await _fetch_meta(fixed)
+                    meta = await _fetch_meta(fixed) or cmeta
                     text = _build_text(fixed, meta, sender)
                     if ckind == "video":
                         await message.answer_video(
@@ -789,11 +812,12 @@ async def on_message(message: Message, bot: Bot) -> None:
                 await asyncio.sleep(4)
                 media = await _fetch_media(fixed)
             status = "fail"
+            yt_meta: dict[str, str] = {}
             if media is None or media[0] == "photo":
                 # Последний рубеж: yt-dlp напрямую с платформы, мимо фиксеров.
                 # Запускаем и когда фиксеры нашли только картинку: возможно,
                 # это видео-пост, у которого фиксеры видят лишь обложку.
-                yt_media, status = await _ytdlp_fetch(
+                yt_media, status, yt_meta = await _ytdlp_fetch(
                     fixed.original,
                     fixed.item,
                     fixed.platform,
@@ -809,6 +833,8 @@ async def on_message(message: Message, bot: Bot) -> None:
                 continue
             restricted = status == "restricted"
             meta = await meta_task
+            if not meta.get("title") and yt_meta:
+                meta = yt_meta  # название/канал от yt-dlp (YouTube и др.)
             text = _build_text(fixed, meta, sender)
             sent = False
 
@@ -832,7 +858,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                             request_timeout=300,
                         )
                         if sent_msg.video:
-                            _recent_put(fixed, "video", sent_msg.video.file_id)
+                            _recent_put(fixed, "video", sent_msg.video.file_id, meta)
                     else:  # photo — фото-пост без видео
                         sent_msg = await message.answer_photo(
                             photo=BufferedInputFile(data, filename="photo.jpg"),
@@ -842,7 +868,7 @@ async def on_message(message: Message, bot: Bot) -> None:
                             request_timeout=120,
                         )
                         if sent_msg.photo:
-                            _recent_put(fixed, "photo", sent_msg.photo[-1].file_id)
+                            _recent_put(fixed, "photo", sent_msg.photo[-1].file_id, meta)
                     sent = True
                 except Exception as e:  # noqa: BLE001
                     log.warning(
