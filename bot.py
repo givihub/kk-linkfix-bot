@@ -345,7 +345,8 @@ async def _ytdlp_fetch(
     max_minutes > 0 — ролики длиннее (и прямые эфиры) пропускаем без скачивания.
     Возвращает (media, status, meta): media = ("video", bytes) при успехе;
     status — "ok" | "restricted" (закрыто владельцем / нужен логин) |
-    "skipped" (не прошёл фильтр длительности) | "fail"; meta — название и
+    "skipped" (не прошёл фильтр длительности) | "retry" (403, стоит
+    повторить) | "fail"; meta — название и
     автор ролика по данным yt-dlp (для подписи, когда фиксеры их не дают).
     """
     proxy = _YT_PROXY if platform == "youtube" else PROXY_URL
@@ -416,7 +417,13 @@ async def _ytdlp_fetch(
                 return None, "skipped", {}
             restricted = any(m in err_text for m in _RESTRICTED_MARKERS)
             log.info("yt-dlp: не вышло (restricted=%s): %s", restricted, err_text[-250:])
-            return None, "restricted" if restricted else "fail", {}
+            if restricted:
+                return None, "restricted", {}
+            # 403 от googlevideo — транзиентный (ссылка на CDN «протухла»
+            # или не совпала привязка), повторная выдача обычно проходит
+            if "403" in err_text:
+                return None, "retry", {}
+            return None, "fail", {}
     except Exception as e:  # noqa: BLE001
         log.warning("yt-dlp: ошибка запуска: %s", e)
         return None, "fail", {}
@@ -823,6 +830,15 @@ async def on_message(message: Message, bot: Bot) -> None:
                     fixed.platform,
                     yt_max_min if fixed.platform == "youtube" else 0,
                 )
+                if yt_media is None and status == "retry":
+                    await asyncio.sleep(3)
+                    log.info("yt-dlp: повтор после 403")
+                    yt_media, status, yt_meta = await _ytdlp_fetch(
+                        fixed.original,
+                        fixed.item,
+                        fixed.platform,
+                        yt_max_min if fixed.platform == "youtube" else 0,
+                    )
                 if yt_media is not None:
                     media = yt_media  # видео побеждает фото
             if media is None and status == "skipped":
