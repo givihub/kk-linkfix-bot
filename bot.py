@@ -87,7 +87,11 @@ BOT_API_URL = os.getenv("BOT_API_URL") or None
 _YTDLP_SORT = os.getenv("YTDLP_SORT", "res:720,vcodec:h264")
 # Отдельный прокси только для YouTube (yt-dlp): домашний VPN-каскад отдаёт
 # googlevideo по 0.2–1 МБ/с, через GW-09 — 5+ МБ/с. Пусто = общий PROXY_URL.
-_YT_PROXY = os.getenv("YOUTUBE_PROXY_URL") or PROXY_URL
+_YT_PROXY = os.getenv("YOUTUBE_PROXY_URL") or os.getenv("MEDIA_PROXY_URL") or PROXY_URL
+# SOCKS-прокси для скачивания медиа с CDN и опроса фиксеров (Instagram/TikTok/X).
+# Через домашний каскад CDN Instagram местами отдаёт 150 КБ/с (40 МБ = 4 мин),
+# через GW-09 — 2.7 МБ/с. При недоступности прокси — откат на прямой путь.
+MEDIA_PROXY_URL = os.getenv("MEDIA_PROXY_URL") or None
 # YouTube в группах: shorts — только Shorts (по умолчанию), all — любые ролики
 # не длиннее YT_GROUP_MAX_MIN минут, off — не трогать. Обычные видео Telegram
 # и так играет сам; в личке с ботом ограничений нет.
@@ -125,6 +129,17 @@ _OG_PATTERNS = (
 )
 
 _http: aiohttp.ClientSession | None = None
+_http_media: aiohttp.ClientSession | None = None  # через MEDIA_PROXY_URL
+
+
+def _routes() -> list[tuple[str, aiohttp.ClientSession, str | None]]:
+    """Пути для запросов к фиксерам/CDN: сначала медиа-прокси, потом прямой."""
+    out: list[tuple[str, aiohttp.ClientSession, str | None]] = []
+    if _http_media is not None:
+        out.append(("proxy", _http_media, None))
+    if _http is not None:
+        out.append(("direct", _http, PROXY_URL))
+    return out
 
 
 class DoHFallbackResolver(AbstractResolver):
@@ -239,34 +254,43 @@ _OG_VIDEO_PATTERNS = (
 async def _probe_candidate(url: str) -> str | None:
     """Спросить у одного фиксера прямой URL медиа (redirect или og:video)."""
     netloc = urlsplit(url).netloc
-    try:
-        async with _http.get(
-            url,
-            proxy=PROXY_URL,
-            allow_redirects=False,
-            headers=_UA,
-            timeout=aiohttp.ClientTimeout(total=6),
-        ) as resp:
-            loc = resp.headers.get("Location", "")
-            if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
-                if _is_platform_host(loc):
-                    log.info("probe %s: redirect обратно на соцсеть — мимо", netloc)
-                    return None
-                log.info("probe %s: redirect → медиа", netloc)
-                return loc
-            if resp.status == 200 and "html" in resp.headers.get("Content-Type", ""):
-                html_text = (await resp.content.read(262_144)).decode("utf-8", "ignore")
-                for pat in _OG_VIDEO_PATTERNS:
-                    m = pat.search(html_text)
-                    if m and m.group(1).startswith("http"):
-                        log.info("probe %s: og:video → медиа", netloc)
-                        return unescape(m.group(1))
-            log.info(
-                "probe %s: status=%s type=%s — медиа не отдал",
-                netloc, resp.status, resp.headers.get("Content-Type", "?"),
-            )
-    except Exception as e:  # noqa: BLE001
-        log.info("probe %s: ошибка %s", netloc, e)
+    for route, sess, proxy in _routes():
+        try:
+            return await _probe_once(sess, proxy, url, netloc)
+        except Exception as e:  # noqa: BLE001
+            log.info("probe %s [%s]: ошибка %s", netloc, route, e or type(e).__name__)
+    return None
+
+
+async def _probe_once(
+    sess: aiohttp.ClientSession, proxy: str | None, url: str, netloc: str
+) -> str | None:
+    """Один запрос к фиксеру. Сетевые ошибки пробрасываются (для отката)."""
+    async with sess.get(
+        url,
+        proxy=proxy,
+        allow_redirects=False,
+        headers=_UA,
+        timeout=aiohttp.ClientTimeout(total=6),
+    ) as resp:
+        loc = resp.headers.get("Location", "")
+        if resp.status in (301, 302, 303, 307, 308) and loc.startswith("http"):
+            if _is_platform_host(loc):
+                log.info("probe %s: redirect обратно на соцсеть — мимо", netloc)
+                return None
+            log.info("probe %s: redirect → медиа", netloc)
+            return loc
+        if resp.status == 200 and "html" in resp.headers.get("Content-Type", ""):
+            html_text = (await resp.content.read(262_144)).decode("utf-8", "ignore")
+            for pat in _OG_VIDEO_PATTERNS:
+                m = pat.search(html_text)
+                if m and m.group(1).startswith("http"):
+                    log.info("probe %s: og:video → медиа", netloc)
+                    return unescape(m.group(1))
+        log.info(
+            "probe %s: status=%s type=%s — медиа не отдал",
+            netloc, resp.status, resp.headers.get("Content-Type", "?"),
+        )
     return None
 
 
@@ -283,7 +307,7 @@ def _media_kind(data: bytes) -> str | None:
 async def _fetch_media(fixed: FixedLink) -> tuple[str, bytes] | None:
     """Перебрать всю цепочку фиксеров. Приоритет — видео; если видео нет
     нигде, но кто-то отдал картинку (фото-пост) — вернём её."""
-    if _http is None:
+    if not _routes():
         return None
     photo: bytes | None = None
     for url in fixed.candidates:
@@ -432,17 +456,34 @@ async def _ytdlp_fetch(
 
 
 async def _download_video(url: str) -> bytes | None:
-    """Скачать видеофайл (в память, до 45 МБ). None при любой ошибке."""
-    if _http is None:
-        return None
+    """Скачать медиафайл в память: сначала через медиа-прокси, при сбое —
+    напрямую. None, если не вышло ни так, ни так."""
+    for route, sess, proxy in _routes():
+        data = await _download_once(sess, proxy, url, route)
+        if data is not None:
+            return data
+    return None
+
+
+async def _download_once(
+    sess: aiohttp.ClientSession, proxy: str | None, url: str, route: str
+) -> bytes | None:
+    t0 = time.monotonic()
     try:
-        async with _http.get(
+        async with sess.get(
             url,
-            proxy=PROXY_URL,
-            headers=_BROWSER_UA,
+            proxy=proxy,
+            # НЕ браузерный UA: на «браузер» CDN Instagram отвечает 302 на
+            # video.xx.fbcdn.net, который из РФ (GW-09) недоступен, а через
+            # каскад часто виснет. С ботовым UA файл отдаётся сразу.
+            headers=_UA,
             # Детектор зависания: 30 с без единого байта — обрыв (а не 2 минуты
             # ожидания); общий потолок 10 минут — для больших файлов
-            timeout=aiohttp.ClientTimeout(total=600, sock_connect=15, sock_read=30),
+            # (через прокси — 8 с на соединение: часть узлов CDN из РФ
+            # заблокирована, быстрее уйти на прямой путь)
+            timeout=aiohttp.ClientTimeout(
+                total=600, sock_connect=8 if route == "proxy" else 15, sock_read=30
+            ),
         ) as resp:
             if resp.status != 200:
                 log.info("CDN ответил %s на %s", resp.status, url[:80])
@@ -461,10 +502,13 @@ async def _download_video(url: str) -> bytes | None:
             if len(buf) < 5_000:
                 log.warning("Скачанное подозрительно мало (%d байт) — отбрасываю", len(buf))
                 return None
-            log.info("Скачано %d КБ с %s", len(buf) // 1024, urlsplit(url).netloc)
+            log.info(
+                "Скачано %d КБ с %s [%s, %.1f с]",
+                len(buf) // 1024, urlsplit(url).netloc, route, time.monotonic() - t0,
+            )
             return bytes(buf)
     except Exception as e:  # noqa: BLE001
-        log.warning("Не удалось скачать видео: %s", e)
+        log.warning("Не удалось скачать видео [%s]: %s", route, e or type(e).__name__)
         return None
 
 
@@ -1014,10 +1058,20 @@ async def main() -> None:
     dp = Dispatcher()
     dp.include_router(router)
 
-    global _http
+    global _http, _http_media
     _http = aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(resolver=DoHFallbackResolver())
     )
+    if MEDIA_PROXY_URL:
+        from aiohttp_socks import ProxyConnector
+
+        # rdns: имена резолвит сам прокси (домашний DNS режет часть фиксеров)
+        _http_media = aiohttp.ClientSession(
+            connector=ProxyConnector.from_url(
+                MEDIA_PROXY_URL.replace("socks5h://", "socks5://", 1), rdns=True
+            )
+        )
+        log.info("Медиа с CDN — через прокси %s (откат — напрямую)", MEDIA_PROXY_URL)
     try:
         me = await bot.get_me()
         log.info("Запущен как @%s (id=%s)", me.username, me.id)
@@ -1025,6 +1079,8 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         await _http.close()
+        if _http_media is not None:
+            await _http_media.close()
 
 
 if __name__ == "__main__":
