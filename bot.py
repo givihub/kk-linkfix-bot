@@ -88,8 +88,10 @@ _YTDLP_SORT = os.getenv("YTDLP_SORT", "res:720,vcodec:h264")
 # Отдельный прокси только для YouTube (yt-dlp): домашний VPN-каскад отдаёт
 # googlevideo по 0.2–1 МБ/с, через GW-09 — 5+ МБ/с. Пусто = общий PROXY_URL.
 _YT_PROXY = os.getenv("YOUTUBE_PROXY_URL") or PROXY_URL
-# YouTube в группах: ролики не длиннее N минут (0 = не обрабатывать в группах).
-# Длинные видео и стримы Telegram и так играет сам — бот их не трогает.
+# YouTube в группах: shorts — только Shorts (по умолчанию), all — любые ролики
+# не длиннее YT_GROUP_MAX_MIN минут, off — не трогать. Обычные видео Telegram
+# и так играет сам; в личке с ботом ограничений нет.
+_YT_GROUP_MODE = os.getenv("YT_GROUP_MODE", "shorts").strip().lower()
 _YT_GROUP_MAX_MIN = int(os.getenv("YT_GROUP_MAX_MIN", "30"))
 
 
@@ -745,10 +747,15 @@ async def on_message(message: Message, bot: Bot) -> None:
     links = _extract_links(message)
     is_private = message.chat.type == ChatType.PRIVATE
 
-    # YouTube в группах — только короткие ролики (YT_GROUP_MAX_MIN; 0 = выкл.):
-    # длинные видео и стримы Telegram играет сам, бот их не трогает
-    if not is_private and _YT_GROUP_MAX_MIN <= 0:
-        links = [f for f in links if f.platform != "youtube"]
+    # YouTube в группах: по умолчанию только Shorts (см. YT_GROUP_MODE)
+    if not is_private:
+        if _YT_GROUP_MODE == "shorts":
+            links = [
+                f for f in links
+                if f.platform != "youtube" or "/shorts/" in f.original
+            ]
+        elif _YT_GROUP_MODE != "all":
+            links = [f for f in links if f.platform != "youtube"]
     yt_max_min = 0 if is_private else _YT_GROUP_MAX_MIN
 
     # Плейлисты YouTube — только в личке, первые 10 роликов
