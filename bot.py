@@ -41,6 +41,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ChatMemberUpdated,
     LinkPreviewOptions,
     Message,
 )
@@ -762,6 +763,51 @@ async def _expand_playlist(url: str) -> list[str]:
     return urls
 
 
+async def _resolve_share(fixed: FixedLink) -> FixedLink:
+    """instagram.com/share/… → настоящий /reel/<id>/ по редиректу Instagram.
+    Fail-soft: при любой ошибке возвращаем ссылку как есть."""
+    for route, sess, proxy in _routes():
+        try:
+            async with sess.get(
+                fixed.original,
+                proxy=proxy,
+                headers=_BROWSER_UA,
+                allow_redirects=True,
+                max_redirects=5,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                final = str(resp.url)
+            resolved = convert(final)
+            if resolved and not resolved.needs_resolve:
+                log.info("share-ссылка раскрыта [%s]: %s", route, resolved.original)
+                return resolved
+            log.info("share-ссылка не раскрылась [%s]: %s", route, final[:120])
+        except Exception as e:  # noqa: BLE001
+            log.info("share-ссылка: ошибка [%s] %s", route, e or type(e).__name__)
+    return fixed
+
+
+def _url_hosts(message: Message) -> list[str]:
+    """Метаданные для лога: host + первый сегмент пути у ссылок сообщения
+    (без полного адреса и без текста — минимизация данных)."""
+    text = message.text or message.caption or ""
+    out: list[str] = []
+    for ent in message.entities or message.caption_entities or []:
+        if ent.type == MessageEntityType.URL:
+            url = ent.extract_from(text)
+        elif ent.type == MessageEntityType.TEXT_LINK and ent.url:
+            url = ent.url
+        else:
+            continue
+        try:
+            parts = urlsplit(url if "://" in url else "https://" + url)
+        except ValueError:
+            continue
+        seg = (parts.path or "/").strip("/").split("/")[0]
+        out.append(f"{parts.netloc.lower()}/{seg}")
+    return out
+
+
 def _extract_links(message: Message) -> list[FixedLink]:
     """Достать из сообщения все конвертируемые ссылки (по entities)."""
     text = message.text or message.caption or ""
@@ -813,7 +859,18 @@ async def on_message(message: Message, bot: Bot) -> None:
                     links.append(fx)
 
     if not links:
+        hosts = _url_hosts(message)
+        if hosts:
+            # ссылка была, но бот её не взял — пишем в лог, чтобы было видно
+            # почему «не работает» (формат не поддерживается / YouTube в группе)
+            log.info(
+                "chat=%s (%s): ссылки пропущены, не поддерживаются: %s",
+                message.chat.id, message.chat.type, hosts,
+            )
         return
+
+    # Короткие share-ссылки Instagram раскрываем до обработки
+    links = [await _resolve_share(f) if f.needs_resolve else f for f in links]
 
     log.info(
         "chat=%s user=%s links=%s",
@@ -1003,6 +1060,22 @@ async def on_message(message: Message, bot: Bot) -> None:
             )
 
 
+@router.my_chat_member()
+async def on_my_chat_member(event: ChatMemberUpdated) -> None:
+    """Бота добавили/удалили/повысили в чате — пишем в лог с правами."""
+    new = event.new_chat_member
+    can_delete = getattr(new, "can_delete_messages", None)
+    log.info(
+        "Бот в чате %s (%s, «%s»): %s → %s, удаление сообщений: %s",
+        event.chat.id,
+        event.chat.type,
+        event.chat.title or "",
+        event.old_chat_member.status,
+        new.status,
+        "да" if can_delete else "нет",
+    )
+
+
 @router.callback_query(F.data.startswith("aud:"))
 async def on_audio_button(cb: CallbackQuery, bot: Bot) -> None:
     """Кнопка «🎵 Звук»: достаём аудиодорожку и шлём ответом на видео."""
@@ -1076,7 +1149,7 @@ async def main() -> None:
         me = await bot.get_me()
         log.info("Запущен как @%s (id=%s)", me.username, me.id)
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "my_chat_member"])
     finally:
         await _http.close()
         if _http_media is not None:

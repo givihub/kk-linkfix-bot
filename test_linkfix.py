@@ -107,6 +107,21 @@ def test_unrelated():
     assert convert("https://example.com/reel/nope/") is None
     assert convert("https://vimeo.com/12345") is None
 
+def test_instagram_username_in_path():
+    f = convert("https://www.instagram.com/some.user_1/reel/DfNDJoOM16q/?igsh=x")
+    assert f and f.original == "https://www.instagram.com/reel/DfNDJoOM16q/"
+    assert f.embed.endswith("/reel/DfNDJoOM16q/")
+    f = convert("https://www.instagram.com/someuser/p/DfNDJoOM16q/?img_index=3")
+    assert f and f.item == 3 and f.original.startswith("https://www.instagram.com/p/")
+    assert convert("https://www.instagram.com/someuser/") is None
+    assert convert("https://www.instagram.com/explore/tags/x/") is None
+
+
+def test_instagram_share_link_needs_resolve():
+    f = convert("https://www.instagram.com/share/reel/BAabc123/")
+    assert f and f.needs_resolve
+    assert not convert("https://www.instagram.com/reel/DfNDJoOM16q/").needs_resolve
+
 
 if __name__ == "__main__":
     import sys

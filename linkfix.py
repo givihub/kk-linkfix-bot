@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -34,7 +35,12 @@ LABEL = {
 
 # Пути Instagram, у которых бывает видео-превью
 # (/stories/ — распознаём, но без авторизации их не достать: бот честно ответит)
-_INSTA_PREFIXES = ("/reel/", "/reels/", "/p/", "/tv/", "/stories/")
+# /<username>/(reel|reels|p|tv)/… — группа 1 = «/<username>»
+_INSTA_USER_PATH = re.compile(
+    r"^(/(?!reel/|reels/|p/|tv/|stories/|share/)[A-Za-z0-9._]{1,30})/(?:reel|reels|p|tv)/"
+)
+
+_INSTA_PREFIXES = ("/reel/", "/reels/", "/p/", "/tv/", "/stories/", "/share/")
 
 
 @dataclass(frozen=True)
@@ -47,6 +53,12 @@ class FixedLink:
     @property
     def label(self) -> str:
         return LABEL.get(self.platform, "Видео")
+
+    @property
+    def needs_resolve(self) -> bool:
+        """Короткая share-ссылка Instagram (/share/…): настоящий адрес поста
+        отдаёт только редирект самого Instagram — бот раскрывает её сам."""
+        return self.platform == "instagram" and "/share/" in self.original
 
     @property
     def candidates(self) -> list[str]:
@@ -74,6 +86,11 @@ def convert(url: str) -> FixedLink | None:
 
     # --- Instagram ---------------------------------------------------------
     if host in ("instagram.com", "ddinstagram.com", *FIX_DOMAINS["instagram"]):
+        # Новый формат ссылок Instagram: /<username>/reel/<id>/ — имя автора
+        # перед типом поста. Фиксеры и yt-dlp понимают только /reel/<id>/.
+        m = _INSTA_USER_PATH.match(path)
+        if m:
+            path = path[m.end(1):]
         if not path.startswith(_INSTA_PREFIXES):
             return None
         # Карусель: img_index=N указывает на конкретный слайд
