@@ -613,8 +613,11 @@ async def _prepare_video(data: bytes) -> tuple[bytes, dict, bytes | None]:
 
 def _sender_mention(message: Message) -> str:
     u = message.from_user
+    if message.sender_chat is not None:
+        # анонимный админ (sender_chat = сама группа) или пост от имени канала
+        return escape(message.sender_chat.title or "аноним")
     if u is None:
-        return escape(message.sender_chat.title if message.sender_chat else "аноним")
+        return "аноним"
     return f'<a href="tg://user?id={u.id}">{escape(u.full_name)}</a>'
 
 
@@ -832,7 +835,15 @@ def _extract_links(message: Message) -> list[FixedLink]:
     F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE})
 )
 async def on_message(message: Message, bot: Bot) -> None:
-    if message.from_user and message.from_user.is_bot:
+    # Сообщения других ботов пропускаем. Но анонимный админ группы и посты
+    # «от имени канала/группы» Telegram тоже присылает от служебного бота
+    # (@GroupAnonymousBot / 136817688) — у них есть sender_chat, их обрабатываем.
+    if message.from_user and message.from_user.is_bot and message.sender_chat is None:
+        if _url_hosts(message):
+            log.info(
+                "chat=%s: ссылку прислал бот @%s — пропускаю",
+                message.chat.id, message.from_user.username,
+            )
         return
     links = _extract_links(message)
     is_private = message.chat.type == ChatType.PRIVATE
